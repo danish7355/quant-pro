@@ -1,0 +1,175 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  TrendingUp, TrendingDown, LayoutDashboard, Settings as SettingsIcon, LineChart, History, ShieldAlert, Terminal,
+  CircleCheck, ChevronRight, RefreshCw, Bell, Sun, Moon, Play, Square, Search, Activity, BarChart2, List, GitPullRequest, Zap, Menu, X
+} from 'lucide-react';
+
+import { auth, loginWithGoogle, logout, saveSettingsToDB, saveStateToDB, db } from './firebase';
+import { doc, getDoc } from 'firebase/firestore';
+import { Timeframe, CoinDetail, Position, TradeLog, AppSettings, EquitySnapshot } from './types';
+import ScannerList from './components/ScannerList';
+import SettingsPanel from './components/SettingsPanel';
+import ActiveTrades from './components/ActiveTrades';
+import TradingChart from './components/TradingChart';
+import PerformancePage from './components/PerformancePage';
+import BacktestLab from './components/BacktestLab';
+import StrategyLab from './components/StrategyLab';
+import RiskCenter from './components/RiskCenter';
+import { runScoringEngine } from './utils/indicators';
+import { manageOpenPositionV3 } from './utils/tradeManager';
+
+
+// Default initial settings
+const INITIAL_SETTINGS: AppSettings = {
+  market: 'CRYPTO',
+  activeStrategy: 'v2',
+  timeframe: '4H',
+  autoTradeThreshold: 60, // Minimum Score for Trade 60 instead of 65
+  coinCount: 20,
+  autoTradeEnabled: true,
+  scanInterval: 300, // 5 minutes default
+  theme: 'dark',
+
+  min24hVolume: 10000000,
+  maxFundingRate: 0.15,
+  maxSpread: 0.3,
+
+  emaFastPeriod: 9,
+  emaSlowPeriod: 55,
+  emaTrendPeriod: 200,
+  emaCrossLookback: 3,
+
+  rsiPeriod: 14,
+  rsiLongMin: 30,
+  rsiLongMax: 65,
+  rsiShortMin: 30,
+  rsiShortMax: 55,
+
+  macdFast: 12,
+  macdSlow: 26,
+  macdSignal: 9,
+  adxPeriod: 14,
+  adxTrendThreshold: 20,
+  superTrendPeriod: 10,
+  superTrendMultiplier: 3.0,
+  volumeMultiplier: 1.5,
+  fibLookback: 100,
+
+  atrPeriod: 14,
+
+  startingBalance: 10000,
+  positionSizePct: 10, // user wants to use only 10%
+  accountRiskPct: 1,
+  leverage: 1, // user said: "i don't want to use leverage" -> means 1x leverage
+  maxConcurrentTrades: 10,
+  dailyLossLimitPct: 3,
+  maxDrawdownPct: 10,
+
+  tp1AtrMultiple: 2.0, // ATR Take Profit
+  tp2AtrMultiple: 3.5,
+  tp3FibLevel: 1.618,
+  slAtrMultiple: 1.5, // ATR Stop Loss
+  minRRRatio: 1.5,
+
+  trailingStopActivation: 'TP1',
+  trailActivationR: 1,
+  timeBasedExitEnabled: true,
+  timeBasedExitCandles: 3,
+
+  telegramBotToken: '',
+  telegramChatId: '',
+  alertOnNewSignal: true,
+  alertOnTradeExecuted: true,
+  alertOnTpHit: true,
+  alertOnSlHit: true,
+  alertOnTsMoved: true,
+  alertOnDailyLossLimit: true,
+  alertOnRangingDetected: false,
+};
+
+// Check local storage for initial values
+const safeGetLocal = (key: string) => {
+  if (typeof window === 'undefined') return null;
+  try {
+    return localStorage.getItem(key);
+  } catch (e) {
+    console.warn(`LocalStorage blocked or failed for ${key}`, e);
+    return null;
+  }
+};
+
+const safeSetLocal = (key: string, value: string) => {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(key, value);
+  } catch (e) {
+    console.warn(`LocalStorage blocked or failed for ${key}`, e);
+  }
+};
+
+const getInitialSettings = (): AppSettings => {
+  const local = safeGetLocal('bt_app_settings');
+  if (local) { try { return { ...INITIAL_SETTINGS, ...JSON.parse(local) }; } catch (e) {} }
+  return INITIAL_SETTINGS;
+};
+
+const getInitialBalance = (): number => {
+  const local = safeGetLocal('bt_demo_balance');
+  if (local) {
+    const parsed = parseFloat(local);
+    if (!isNaN(parsed)) return parsed;
+  }
+  return 10000;
+};
+
+const getInitialPositions = (): Position[] => {
+  const local = safeGetLocal('bt_positions');
+  if (local) { 
+    try { 
+      const parsed = JSON.parse(local) || [];
+      const unique = [];
+      const seen = new Set();
+      for (const pos of parsed) {
+        if (!seen.has(pos.id)) {
+          seen.add(pos.id);
+          unique.push(pos);
+        }
+      }
+      return unique;
+    } catch (e) {} 
+  }
+  return [];
+};
+
+const getInitialTradeLogs = (): TradeLog[] => {
+  const local = safeGetLocal('bt_trade_logs');
+  if (local) { 
+    try { 
+      const parsed = JSON.parse(local) || [];
+      // Deduplicate by ID in case of strict-mode double closures from previous bugs
+      const unique = [];
+      const seen = new Set();
+      for (const log of parsed) {
+        if (!seen.has(log.id)) {
+          seen.add(log.id);
+          unique.push(log);
+        }
+      }
+      return unique;
+    } catch (e) {} 
+  }
+  return [];
+};
+
+const getInitialEquitySnapshots = (): EquitySnapshot[] => {
+  const local = safeGetLocal('bt_equity_snapshots');
+  if (local) { try { return JSON.parse(local) || []; } catch (e) {} }
+  return [];
+};
+
+export default function App() {

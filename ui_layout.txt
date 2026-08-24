@@ -1,0 +1,109 @@
+                settings={settings} 
+                onUpdateSettings={setSettings} 
+                onResetBalance={handleResetBalance}
+                onResetSettings={handleResetSettings}
+            />
+          )}
+
+          {activeTab === 'dashboard' && (
+            <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+              <div className="xl:col-span-2 space-y-6">
+                <ActiveTrades positions={positions} onManualClose={handleManualClose} />
+                {currentCoinDetail ? (
+                  <TradingChart coin={currentCoinDetail} activePosition={positions.find((p) => p.symbol === currentCoinDetail.symbol)} />
+                ) : (
+                  <div className="h-96 flex flex-col items-center justify-center bg-gray-900 border border-gray-800 rounded-xl relative p-6">
+                    <RefreshCw className="w-10 h-10 stroke-indigo-400 mb-2 animate-spin" />
+                    <span className="text-gray-400 text-sm font-semibold uppercase tracking-wider">Synchronizing market candles loop...</span>
+                  </div>
+                )}
+              </div>
+              <div className="space-y-6">
+                 <div className="bg-[#05080f] border border-gray-800 rounded-xl p-4 shadow-inner">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest flex items-center">
+                      <Terminal className="w-3.5 h-3.5 mr-1.5" /> Quant Event Log Output Console
+                    </span>
+                  </div>
+                  <div className="h-96 overflow-y-auto font-mono text-[10px] text-gray-400 space-y-1.5 divide-y divide-gray-900/40 pr-2">
+                    {terminalLogs.length === 0 ? (
+                      <span className="text-gray-600">Console empty. Boot stream ready.</span>
+                    ) : (
+                      terminalLogs.map((logStr, index) => (
+                        <div key={index} className="pt-1.5">{logStr}</div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'backtest' && (
+            <BacktestLab settings={settings} coins={coins} />
+          )}
+
+          {activeTab === 'strategy_lab' && (
+            <StrategyLab settings={settings} onUpdateSettings={setSettings} />
+          )}
+
+          {activeTab === 'risk_center' && (
+            <RiskCenter
+              settings={settings}
+              onUpdateSettings={setSettings}
+              balance={balance}
+              positions={positions}
+              onManualClose={handleManualClose}
+              setEngineRunning={setEngineRunning}
+            />
+          )}
+
+          {activeTab === 'history' && (
+             <PerformancePage
+              logs={tradeLogs}
+              snapshots={equitySnapshots}
+              currentBalance={totalAccountValue}
+              startingBalance={settings.startingBalance}
+            />
+          )}
+          
+          {activeTab === 'chart' && (
+            <div className="h-full">
+              {currentCoinDetail ? (
+                <TradingChart coin={currentCoinDetail} activePosition={positions.find((p) => p.symbol === currentCoinDetail.symbol)} />
+              ) : (
+                <div className="h-full flex flex-col items-center justify-center bg-[#05080f] border border-[#30363D] rounded-xl relative p-6">
+                  <RefreshCw className="w-10 h-10 stroke-indigo-400 mb-2 animate-spin" />
+                  <span className="text-gray-400 text-sm font-semibold uppercase tracking-wider">Synchronizing market candles loop...</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {activeTab === 'positions' && (
+            <div className="h-full">
+               <ActiveTrades positions={positions} onManualClose={handleManualClose} />
+            </div>
+          )}
+
+          {activeTab === 'logs' && (
+             <div className="h-full bg-[#05080f] border border-gray-800 rounded-xl p-4 shadow-inner flex flex-col">
+              <div className="flex items-center justify-between mb-4">
+                <span className="text-[12px] font-bold text-indigo-400 uppercase tracking-widest flex items-center">
+                  <Terminal className="w-4 h-4 mr-2" /> Quant Event Log Output Console
+                </span>
+              </div>
+              <div className="flex-1 overflow-y-auto font-mono text-[11px] text-gray-400 space-y-2 divide-y divide-gray-900/40 pr-2">
+                {terminalLogs.length === 0 ? (
+                  <span className="text-gray-600">Console empty. Boot stream ready.</span>
+                ) : (
+                  terminalLogs.map((logStr, index) => (
+                    <div key={index} className="pt-2">{logStr}</div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+        </main>
+      </div>
+    </div>

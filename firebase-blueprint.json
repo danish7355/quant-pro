@@ -1,0 +1,20 @@
+{
+  "entities": {
+    "BotState": {
+      "title": "BotState",
+      "description": "Global state of the bot",
+      "type": "object",
+      "properties": {
+        "stateStr": { "type": "string" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["stateStr", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "bot/state": {
+      "schema": "BotState",
+      "description": "Global trading bot state"
+    }
+  }
+}

@@ -1,0 +1,144 @@
+    const connectWS = () => {
+      if (settingsRef.current.market === 'NSE') {
+        const interval = setInterval(() => {
+          // generate mock data for current positions and coins
+          const mockData = [...positionsRef.current.map(p => p.symbol), ...coins.map(c => c.symbol)]
+            .filter((v, i, a) => a.indexOf(v) === i) // unique
+            .map(symbol => {
+               const pos = positionsRef.current.find(p => p.symbol === symbol);
+               const c = coins.find(c => c.symbol === symbol);
+               const currentPrice = pos ? pos.currentPrice : (c ? c.price : 1000);
+               const variation = currentPrice * (Math.random() * 0.002 - 0.001); // 0.1% volatility
+               return { 
+                 s: symbol, 
+                 c: (currentPrice + variation).toString(),
+                 o: (currentPrice).toString() // mock open
+               };
+            });
+          handleWsData(mockData);
+        }, 3000);
+        
+        // Mock the ws object for the cleanup function
+        ws = {
+           close: () => clearInterval(interval)
+        } as any;
+        return;
+      }
+
+      ws = new WebSocket('wss://stream.binance.com/ws/!miniTicker@arr');
+
+      ws.onmessage = (event) => {
+        let data;
+        try {
+          data = JSON.parse(event.data);
+        } catch (e) {
+          return;
+        }
+        handleWsData(data);
+      };
+
+      ws.onerror = (err) => {
+        console.warn("Binance WS error");
+        ws.close();
+      };
+
+      ws.onclose = () => {
+        console.log("Binance WS closed, reconnecting in 3s...");
+        reconnectTimeout = setTimeout(connectWS, 3000);
+      };
+    };
+
+    const handleWsData = (data: any[]) => {
+        if (!Array.isArray(data)) return;
+
+        // Process closures synchronously based on latest prices
+        const currentPositions = positionsRef.current;
+        let positionsChanged = false;
+        
+        currentPositions.forEach(p => {
+           const ticker = data.find((t: any) => t.s === p.symbol);
+           let currentPrice = p.currentPrice;
+           let trailStop = p.trailingStop;
+           
+           if (ticker) {
+              currentPrice = parseFloat(ticker.c);
+           }
+           
+           const isLong = p.direction === 'LONG';
+           let closedReason: TradeLog['exitReason'] | null = null;
+           let pnl = isLong ? (currentPrice - p.entryPrice) * p.quantity : (p.entryPrice - currentPrice) * p.quantity;
+           
+           if (settingsRef.current.activeStrategy === 'v3' || settingsRef.current.activeStrategy === 'climax_reversal') {
+             // For v3, rely on manageOpenPositionV3 from tradeManager
+             // We'll update the state later in setPositions using the same logic.
+             // Here we only check for full EXIT to call closePosition synchronously.
+             // We need elapsed hours
+             const timeOpen = new Date(p.timeOpen).getTime();
+             const elapsedHours = (Date.now() - timeOpen) / (1000 * 60 * 60);
+             const result = manageOpenPositionV3(
+               p, 
+               { open: currentPrice, high: currentPrice, low: currentPrice, close: currentPrice },
+               p.entryAtr,
+               elapsedHours,
+               settingsRef.current.timeBasedExitCandles // assuming 1 candle = 1 hour or similar
+             );
+             if (result.action === 'EXIT') {
+               closePosition({ ...p, currentPrice, unrealizedPnl: pnl }, result.reason as any);
+             } else if (result.action.startsWith('PARTIAL') && result.partialRatio) {
+               // handle partial exit
+               // We don't remove from positions, just update balance and log it.
+               // We also need to update the position's quantity and allocated balance so it doesn't get double counted.
+               // But wait, setPositions handles the state update of sizeRemainingPct via the map loop below.
+               // However, we also need to adjust quantity and allocatedBalance!
+               // I will handle the state update below, but here I can log the partial close.
+               closePartialPosition({ ...p, currentPrice, unrealizedPnl: pnl }, result.reason as any, result.partialRatio);
+             }
+             return;
+           }
+
+           // Original v2 (SMC) logic
+           if (isLong) {
+              if (currentPrice <= p.sl) closedReason = 'SL';
+              else if (currentPrice >= p.tp3) closedReason = 'TP3';
+           } else {
+              if (currentPrice >= p.sl) closedReason = 'SL';
+              else if (currentPrice <= p.tp3) closedReason = 'TP3';
+           }
+           
+           if (closedReason) {
+              closePosition({ ...p, currentPrice, unrealizedPnl: pnl }, closedReason);
+           }
+        });
+
+        // Update positions
+        setPositions(prev => {
+          let changed = false;
+          const next = prev.map(p => {
+            const ticker = data.find((t: any) => t.s === p.symbol);
+            if (ticker) {
+              const newPrice = parseFloat(ticker.c);
+              if (newPrice !== p.currentPrice) {
+                changed = true;
+                const isLong = p.direction === 'LONG';
+                const pnl = isLong ? (newPrice - p.entryPrice) * p.quantity : (p.entryPrice - newPrice) * p.quantity;
+                
+                if (settingsRef.current.activeStrategy === 'v3' || settingsRef.current.activeStrategy === 'climax_reversal') {
+                   const timeOpen = new Date(p.timeOpen).getTime();
+                   const elapsedHours = (Date.now() - timeOpen) / (1000 * 60 * 60);
+                   const result = manageOpenPositionV3(
+                     p, 
+                     { open: newPrice, high: newPrice, low: newPrice, close: newPrice },
+                     p.entryAtr,
+                     elapsedHours,
+                     settingsRef.current.timeBasedExitCandles
+                   );
+                   
+                   let updatedPos = result.updatedPosition;
+                   if (updatedPos.sizeRemainingPct !== p.sizeRemainingPct) {
+                     // Need to shrink quantity and allocatedBalance
+                     const shrinkRatio = updatedPos.sizeRemainingPct / p.sizeRemainingPct;
+                     updatedPos.quantity = updatedPos.quantity * shrinkRatio;
+                     updatedPos.allocatedBalance = updatedPos.allocatedBalance * shrinkRatio;
+                     // also shrink unrealizedPnl so the percentage makes sense? It will be recomputed on next tick.
+                   }
+                   return { ...updatedPos, currentPrice: newPrice, unrealizedPnl: pnl * (updatedPos.sizeRemainingPct / 100) };

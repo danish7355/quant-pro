@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+@theme {
+  --animate-flash-green: flash-green 0.5s ease-out;
+  --animate-flash-red: flash-red 0.5s ease-out;
+
+  @keyframes flash-green {
+    0% { color: #34d399; text-shadow: 0 0 8px rgba(52,211,153,0.5); }
+    100% { color: inherit; text-shadow: none; }
+  }
+
+  @keyframes flash-red {
+    0% { color: #fb7185; text-shadow: 0 0 8px rgba(251,113,133,0.5); }
+    100% { color: inherit; text-shadow: none; }
+  }
+}

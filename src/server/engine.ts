@@ -1,0 +1,668 @@
+import WebSocket from 'ws';
+import { CoinDetail, Position, TradeLog, AppSettings, EquitySnapshot, Timeframe } from '../types';
+import { runScoringEngine } from '../utils/indicators';
+import { manageOpenPositionV3 } from '../utils/tradeManager';
+import { db } from './firebase';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
+
+
+// Firebase Sync
+export async function loadStateFromFirebase() {
+  if (!db) return;
+  try {
+    const docSnap = await getDoc(doc(db, "bot", "state"));
+    if (docSnap.exists()) {
+      const data = docSnap.data();
+      if (data && data.stateStr) {
+        const loadedState = JSON.parse(data.stateStr);
+        if (loadedState.settings) {
+          state.settings = { ...state.settings, ...loadedState.settings };
+        }
+        if (typeof loadedState.balance === 'number') {
+          state.balance = loadedState.balance;
+        }
+        if (Array.isArray(loadedState.positions)) {
+          state.positions = loadedState.positions;
+        }
+        if (Array.isArray(loadedState.tradeLogs)) {
+          state.tradeLogs = loadedState.tradeLogs;
+        }
+        if (Array.isArray(loadedState.equitySnapshots)) {
+          state.equitySnapshots = loadedState.equitySnapshots;
+        }
+        if (Array.isArray(loadedState.terminalLogs)) {
+          state.terminalLogs = loadedState.terminalLogs;
+        }
+        console.log("[ENGINE] State loaded from Firebase.");
+      }
+    } else {
+      console.log("[ENGINE] No Firebase state found. Using default.");
+    }
+  } catch (e) {
+    console.error("[ENGINE] Failed to load state from Firebase:", e);
+  }
+}
+
+let syncTimeout: any = null;
+export function scheduleStateSync() {
+  if (!db) return;
+  if (syncTimeout) return;
+  syncTimeout = setTimeout(async () => {
+    syncTimeout = null;
+    try {
+      // Persist only necessary bot state without large transient scanner candles
+      const persistentState = {
+        settings: state.settings,
+        balance: state.balance,
+        positions: state.positions,
+        tradeLogs: state.tradeLogs.slice(0, 100),
+        equitySnapshots: state.equitySnapshots.slice(-100),
+        terminalLogs: state.terminalLogs.slice(0, 30)
+      };
+      await setDoc(doc(db, "bot", "state"), {
+        stateStr: JSON.stringify(persistentState),
+        updatedAt: Date.now()
+      });
+    } catch(e) {
+      console.error("[ENGINE] Failed to sync state to Firebase:", e);
+    }
+  }, 2000);
+}
+
+// Global State
+export let state = {
+  settings: {
+    market: 'CRYPTO',
+    activeStrategy: 'v2',
+    timeframe: '4H' as Timeframe,
+    autoTradeThreshold: 60,
+    coinCount: 20,
+    autoTradeEnabled: true,
+    scanInterval: 30,
+    theme: 'dark',
+    min24hVolume: 100000000,
+    maxFundingRate: 0.01,
+    maxSpread: 0.5,
+    emaFastPeriod: 9,
+    emaSlowPeriod: 21,
+    emaTrendPeriod: 200,
+    emaCrossLookback: 5,
+    rsiPeriod: 14,
+    rsiLongMin: 30,
+    rsiLongMax: 60,
+    rsiShortMin: 40,
+    rsiShortMax: 70,
+    macdFast: 12,
+    macdSlow: 26,
+    macdSignal: 9,
+    adxPeriod: 14,
+    adxTrendThreshold: 25,
+    superTrendPeriod: 10,
+    superTrendMultiplier: 3,
+    volumeMultiplier: 1.5,
+    fibLookback: 100,
+    atrPeriod: 14,
+    startingBalance: 1000,
+    positionSizePct: 10,
+    accountRiskPct: 2,
+    leverage: 10,
+    maxConcurrentTrades: 3,
+    dailyLossLimitPct: 5,
+    maxDrawdownPct: 10,
+    tp1AtrMultiple: 2,
+    tp2AtrMultiple: 3,
+    tp3FibLevel: 1.618,
+    slAtrMultiple: 1.5,
+    minRRRatio: 1.5,
+    trailingStopActivation: 'TP1',
+    trailActivationR: 1.0,
+    timeBasedExitEnabled: true,
+    timeBasedExitCandles: 24,
+    telegramBotToken: '',
+    telegramChatId: '',
+    alertOnNewSignal: true,
+    alertOnTradeExecuted: true,
+    alertOnTpHit: true,
+    alertOnSlHit: true,
+    alertOnTsMoved: true,
+    alertOnDailyLossLimit: true,
+    alertOnRangingDetected: false
+  } as AppSettings,
+  balance: 1000,
+  positions: [] as Position[],
+  tradeLogs: [] as TradeLog[],
+  equitySnapshots: [] as EquitySnapshot[],
+  coins: [] as CoinDetail[],
+  terminalLogs: [] as string[]
+};
+
+export function addTerminalLog(msg: string) {
+  state.terminalLogs.unshift(`[${new Date().toLocaleTimeString()}] ${msg}`);
+  if (state.terminalLogs.length > 50) state.terminalLogs.pop();
+  console.log(`[ENGINE] ${msg}`);
+}
+
+async function dispatchTelegramAlert(text: string) {
+  if (!state.settings.telegramBotToken || !state.settings.telegramChatId) return;
+  try {
+    const url = `https://api.telegram.org/bot${state.settings.telegramBotToken}/sendMessage`;
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: state.settings.telegramChatId, text, parse_mode: 'Markdown' })
+    });
+  } catch (e) {
+    console.error("Telegram error", e);
+  }
+}
+
+// Dummy fetchers for Node
+async function fetchTopFuturesPairs() {
+  if (state.settings.market === 'NSE') {
+    return [
+      { symbol: 'RELIANCE', price: 2950.40, change24h: 1.25 },
+      { symbol: 'HDFCBANK', price: 1640.20, change24h: -0.45 },
+      { symbol: 'TCS', price: 3890.15, change24h: 0.85 }
+    ].slice(0, state.settings.coinCount);
+  }
+  
+  const endpoints = [
+    'https://fapi.binance.com/fapi/v1/ticker/24hr',
+    'https://data-api.binance.vision/api/v3/ticker/24hr',
+    'https://api.binance.com/api/v3/ticker/24hr',
+    'https://api1.binance.com/api/v3/ticker/24hr',
+    'https://api2.binance.com/api/v3/ticker/24hr',
+    'https://api3.binance.com/api/v3/ticker/24hr'
+  ];
+  let data: any = null;
+  let isMexc = false;
+
+  for (const url of endpoints) {
+    try {
+      const response = await fetch(url);
+      data = await response.json();
+      if (Array.isArray(data)) break;
+    } catch (e) {
+      console.warn(`Failed to fetch from ${url}`);
+    }
+  }
+
+  // Fallback to MEXC API which is identical to Binance API but without strict IP bans
+  if (!Array.isArray(data)) {
+    console.warn('Binance endpoints failed or returned non-array, falling back to MEXC...', data);
+    try {
+      const response = await fetch('https://api.mexc.com/api/v3/ticker/24hr');
+      data = await response.json();
+      if (Array.isArray(data)) isMexc = true;
+    } catch (e) {
+      console.warn('Failed to fetch from MEXC fallback');
+    }
+  }
+
+  if (!Array.isArray(data)) {
+    console.warn('All API endpoints (Binance & MEXC) failed or returned non-array');
+    return [];
+  }
+
+  try {
+    return data
+      .filter((c: any) => c.symbol.endsWith('USDT'))
+      .sort((a: any, b: any) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+      .slice(0, state.settings.coinCount)
+      .map((c: any) => ({
+        symbol: c.symbol,
+        price: parseFloat(c.lastPrice),
+        // MEXC returns ratio (0.0981), Binance returns percentage (9.81)
+        change24h: parseFloat(c.priceChangePercent) * (isMexc ? 100 : 1)
+      }));
+  } catch (e) {
+    console.error(e);
+    return [];
+  }
+}
+
+async function fetchKlines(symbol: string, timeframe: Timeframe) {
+  if (state.settings.market === 'NSE') {
+    const now = Math.floor(Date.now() / 1000) - 500 * 14400;
+    const arr = [];
+    let lastPrice = 1000;
+    if (symbol === 'RELIANCE') lastPrice = 2950;
+    
+    let trendCycle = Math.random() * Math.PI * 2;
+    for (let i = 0; i < 500; i++) {
+      trendCycle += 0.15; 
+      const baseTrend = Math.sin(trendCycle) * lastPrice * 0.02; 
+      const noise = (Math.random() - 0.5) * lastPrice * 0.015; 
+      const change = baseTrend + noise;
+      const nextPrice = lastPrice + change;
+      
+      arr.push({
+        time: now + i * 14400,
+        open: lastPrice,
+        high: Math.max(lastPrice, nextPrice) + Math.abs(noise),
+        low: Math.min(lastPrice, nextPrice) - Math.abs(noise),
+        close: nextPrice,
+        volume: Math.random() * 100000 + 10000,
+      });
+      lastPrice = nextPrice;
+    }
+    return arr;
+  }
+
+  let binanceTf = timeframe.toLowerCase();
+  if (binanceTf === '1h') binanceTf = '1h';
+  if (binanceTf === '4h') binanceTf = '4h';
+  if (binanceTf === '1d') binanceTf = '1d';
+  
+  const endpoints = [
+    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
+    `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
+    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
+    `https://api1.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
+    `https://api2.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
+    `https://api3.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`
+  ];
+
+  let data: any = null;
+  for (const url of endpoints) {
+    try {
+      const response = await fetch(url);
+      data = await response.json();
+      if (Array.isArray(data)) break;
+    } catch (e) {
+      console.warn(`Failed to fetch klines from ${url}`);
+    }
+  }
+
+  if (!Array.isArray(data)) {
+    console.warn(`Binance Klines API failed for ${symbol}, falling back to MEXC...`);
+    let mexcTf = binanceTf;
+    if (mexcTf === '1h') mexcTf = '60m';
+    try {
+      const response = await fetch(`https://api.mexc.com/api/v3/klines?symbol=${symbol}&interval=${mexcTf}&limit=300`);
+      data = await response.json();
+    } catch (e) {
+      console.warn(`Failed to fetch klines from MEXC fallback for ${symbol}`);
+    }
+  }
+
+  if (!Array.isArray(data)) {
+    console.warn(`All Klines API endpoints failed or returned non-array for ${symbol}:`, data);
+    return [];
+  }
+
+  try {
+    return data.map((d: any) => ({
+      time: d[0] / 1000,
+      open: parseFloat(d[1]),
+      high: parseFloat(d[2]),
+      low: parseFloat(d[3]),
+      close: parseFloat(d[4]),
+      volume: parseFloat(d[5]),
+    }));
+  } catch (e) {
+    return [];
+  }
+}
+
+export async function scanMarkets() {
+  addTerminalLog(`Scanning ${state.settings.market} market...`);
+  const topCoins = await fetchTopFuturesPairs();
+  const updatedCoins: CoinDetail[] = [];
+
+  for (const c of topCoins) {
+    // Add small delay to prevent IP bans from burst requests
+    await new Promise(r => setTimeout(r, 200));
+
+    const candles = await fetchKlines(c.symbol, state.settings.timeframe);
+    if (candles.length < 200) continue;
+
+    const analysis = runScoringEngine(candles, state.settings);
+    
+    updatedCoins.push({
+      symbol: c.symbol,
+      price: c.price,
+      change24h: c.change24h,
+      score: analysis.score,
+      direction: analysis.direction as any,
+      status: analysis.status as any,
+      statusReason: analysis.reason,
+      fundingRate: 0.01,
+      indicators: analysis.indicators,
+      gates: analysis.gates,
+      wmPattern: analysis.wmPattern as any,
+      candles: candles
+    });
+  }
+  
+  state.coins = updatedCoins.sort((a, b) => b.score - a.score);
+  processAutoTradingRules(state.coins);
+}
+
+function processAutoTradingRules(scannedList: CoinDetail[]) {
+  if (!state.settings.autoTradeEnabled) return;
+  const openCount = state.positions.length;
+  if (openCount >= state.settings.maxConcurrentTrades) return;
+
+  const validCandidates = scannedList.filter(c => 
+    c.score >= state.settings.autoTradeThreshold && 
+    c.direction !== 'NEUTRAL' &&
+    !state.positions.some(p => p.symbol === c.symbol)
+  );
+
+  if (validCandidates.length > 0) {
+    const topCandidate = validCandidates[0];
+    openPosition(topCandidate);
+  }
+}
+
+function openPosition(coin: CoinDetail) {
+  const atr = coin.indicators.atr;
+  const buffer = atr * 0.2; // 0.2 ATR buffer for SL
+
+  let sl: number;
+  let tp1: number;
+  let tp2: number;
+  let tp3: number;
+
+  const supportsBelow = [...new Set(coin.indicators.supportResistance.supports)].filter(s => s < coin.price).sort((a, b) => b - a);
+  const resistancesAbove = [...new Set(coin.indicators.supportResistance.resistances)].filter(r => r > coin.price).sort((a, b) => a - b);
+
+  if (coin.direction === 'LONG') {
+    const validSupports = supportsBelow.filter(s => s < coin.price - (atr * 0.2));
+    sl = validSupports.length > 0 ? validSupports[0] - buffer : coin.price - (atr * state.settings.slAtrMultiple);
+    
+    const validResistances = resistancesAbove.filter(r => r > coin.price + (atr * 0.2));
+    tp1 = validResistances.length > 0 ? validResistances[0] : coin.price + (atr * state.settings.tp1AtrMultiple);
+    tp2 = validResistances.length > 1 ? validResistances[1] : (tp1 + atr * 2);
+    tp3 = validResistances.length > 2 ? validResistances[2] : (tp2 + atr * 2);
+  } else {
+    const validResistances = resistancesAbove.filter(r => r > coin.price + (atr * 0.2));
+    sl = validResistances.length > 0 ? validResistances[0] + buffer : coin.price + (atr * state.settings.slAtrMultiple);
+    
+    const validSupports = supportsBelow.filter(s => s < coin.price - (atr * 0.2));
+    tp1 = validSupports.length > 0 ? validSupports[0] : coin.price - (atr * state.settings.tp1AtrMultiple);
+    tp2 = validSupports.length > 1 ? validSupports[1] : (tp1 - atr * 2);
+    tp3 = validSupports.length > 2 ? validSupports[2] : (tp2 - atr * 2);
+  }
+
+  const slDist = Math.abs(coin.price - sl);
+  const riskAmount = state.balance * (state.settings.accountRiskPct / 100);
+  const qty = riskAmount / slDist;
+  const allocatedBalance = (coin.price * qty) / state.settings.leverage;
+
+  const newPos: Position = {
+    id: Math.random().toString(36).substr(2, 9),
+    symbol: coin.symbol,
+    direction: coin.direction as 'LONG'|'SHORT',
+    entryPrice: coin.price,
+    currentPrice: coin.price,
+    quantity: qty,
+    leverage: state.settings.leverage,
+    allocatedBalance,
+    tp1, tp2, tp3, sl,
+    trailingStop: null,
+    trailingStopActive: false,
+    entryAtr: atr,
+    timeOpen: new Date().toISOString(),
+    scoreAtEntry: coin.score,
+    maxProfitablePrice: coin.price,
+    unrealizedPnl: 0,
+    realizedPnl: 0,
+    sizeRemainingPct: 100
+  };
+
+  state.positions.push(newPos);
+  scheduleStateSync();
+  state.balance -= allocatedBalance;
+  addTerminalLog(`Opened ${coin.direction} on ${coin.symbol} at ${coin.price}`);
+  if (state.settings.alertOnTradeExecuted) {
+    dispatchTelegramAlert(`🚨 *NEW TRADE EXECUTED*\nSymbol: ${coin.symbol}\nDirection: ${coin.direction}\nEntry: ${coin.price.toFixed(4)}\nSL: ${sl.toFixed(4)}\nTP1: ${tp1.toFixed(4)}`);
+  }
+}
+
+export function closeManualPosition(id: string) {
+  const pos = state.positions.find(p => p.id === id);
+  if (!pos) return;
+  closePosition(pos, 'MANUAL');
+}
+
+export function closePartialPosition(pos: Position, reason: TradeLog["exitReason"], partialRatio: number) {
+  const idx = state.positions.findIndex(p => p.id === pos.id);
+  if (idx === -1) return;
+  const pnl = pos.unrealizedPnl * partialRatio;
+  const marginFreed = pos.allocatedBalance * partialRatio;
+  state.balance += (marginFreed + pnl);
+  
+  const log: TradeLog = {
+    id: Math.random().toString(36).substr(2, 9),
+    symbol: pos.symbol,
+    direction: pos.direction,
+    entryPrice: pos.entryPrice,
+    closePrice: pos.currentPrice,
+    leverage: pos.leverage,
+    profit: pnl,
+    pctReturn: (pnl / marginFreed) * 100,
+    exitReason: reason,
+    timeOpen: pos.timeOpen,
+    timeClose: new Date().toISOString(),
+    scoreAtEntry: pos.scoreAtEntry,
+    scoreAtClose: 0
+  };
+  state.tradeLogs.unshift(log);
+  if (state.tradeLogs.length > 500) state.tradeLogs.pop();
+  scheduleStateSync();
+    if (state.tradeLogs.length > 500) state.tradeLogs.pop();
+  state.equitySnapshots.push({ time: new Date().toISOString(), balance: state.balance });
+  scheduleStateSync();
+  addTerminalLog(`🔸 PARTIAL CLOSED ${pos.symbol} [${reason}] PNL: $${pnl.toFixed(2)}`);
+}
+
+export function closePosition(pos: Position, reason: TradeLog['exitReason']) {
+  const idx = state.positions.findIndex(p => p.id === pos.id);
+  if (idx === -1) return;
+  
+  state.positions.splice(idx, 1);
+  const profit = pos.unrealizedPnl;
+  state.balance += (pos.allocatedBalance + profit);
+
+  const log: TradeLog = {
+    id: Math.random().toString(36).substr(2, 9),
+    symbol: pos.symbol,
+    direction: pos.direction,
+    entryPrice: pos.entryPrice,
+    closePrice: pos.currentPrice,
+    leverage: pos.leverage,
+    profit,
+    pctReturn: (profit / pos.allocatedBalance) * 100,
+    exitReason: reason,
+    timeOpen: pos.timeOpen,
+    timeClose: new Date().toISOString(),
+    scoreAtEntry: pos.scoreAtEntry,
+    scoreAtClose: 0
+  };
+  state.tradeLogs.unshift(log);
+  state.equitySnapshots.push({ time: new Date().toISOString(), balance: state.balance });
+  scheduleStateSync();
+  addTerminalLog(`🔴 CLOSED ${pos.symbol} [${reason}] PNL: $${profit.toFixed(2)}`);
+  
+  if (state.settings.alertOnTpHit && reason.includes('TP')) {
+    dispatchTelegramAlert(`✅ *TAKE PROFIT HIT*\nSymbol: ${pos.symbol}\nReason: ${reason}\nProfit: $${profit.toFixed(2)}`);
+  } else if (state.settings.alertOnSlHit && (reason === 'SL' || reason === 'TS')) {
+    dispatchTelegramAlert(`🛑 *STOP LOSS HIT*\nSymbol: ${pos.symbol}\nReason: ${reason}\nLoss: $${profit.toFixed(2)}`);
+  }
+}
+
+// Websocket and Live Pricing
+let ws: WebSocket | null = null;
+let nseInterval: any = null;
+let reconnectTimeout: any = null;
+
+function connectWS() {
+  if (state.settings.market === 'NSE') {
+    // NSE polling mock logic
+    nseInterval = setInterval(() => {
+       const data = state.positions.map(p => ({
+         s: p.symbol,
+         c: (p.currentPrice * (1 + (Math.random() * 0.002 - 0.001))).toString()
+       }));
+       handleWsData(data);
+    }, 3000);
+    return;
+  }
+
+  ws = new WebSocket('wss://data-stream.binance.vision/ws/!miniTicker@arr');
+  
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+      handleWsData(data);
+    } catch (e) {}
+  });
+
+  ws.on('error', (err) => {
+    console.warn("Binance WS error:", err.message);
+    if (ws) ws.close();
+  });
+
+  ws.on('close', () => {
+    console.log("Binance WS closed, reconnecting in 3s...");
+    reconnectTimeout = setTimeout(connectWS, 3000);
+  });
+}
+
+function handleWsData(data: any[]) {
+  if (!Array.isArray(data)) return;
+
+  // Process closures synchronously
+  // We need to iterate over a copy of positions because closePosition modifies the array
+  const currentPositions = [...state.positions];
+  
+  currentPositions.forEach(p => {
+     const ticker = data.find((t: any) => t.s === p.symbol);
+     if (!ticker) return;
+     
+     const currentPrice = parseFloat(ticker.c);
+     const isLong = p.direction === 'LONG';
+     let closedReason: TradeLog['exitReason'] | null = null;
+     const pnl = isLong ? (currentPrice - p.entryPrice) * p.quantity : (p.entryPrice - currentPrice) * p.quantity;
+     
+     if (state.settings.activeStrategy === 'v3' || state.settings.activeStrategy === 'climax_reversal') {
+       const timeOpen = new Date(p.timeOpen).getTime();
+       const elapsedHours = (Date.now() - timeOpen) / (1000 * 60 * 60);
+       const result = manageOpenPositionV3(
+         p, 
+         { open: currentPrice, high: currentPrice, low: currentPrice, close: currentPrice },
+         p.entryAtr,
+         elapsedHours,
+         state.settings.timeBasedExitCandles
+       );
+       
+       if (result.action === 'EXIT') {
+         closePosition({ ...p, currentPrice, unrealizedPnl: pnl }, result.reason as any);
+       } else if (result.action.startsWith('PARTIAL') && result.partialRatio) {
+         closePartialPosition({ ...p, currentPrice, unrealizedPnl: pnl }, result.reason as any, result.partialRatio);
+         
+         // Update the actual position remaining size
+         const idx = state.positions.findIndex(pos => pos.id === p.id);
+         if (idx !== -1) {
+            const shrinkRatio = result.updatedPosition.sizeRemainingPct / state.positions[idx].sizeRemainingPct;
+            state.positions[idx].quantity *= shrinkRatio;
+            state.positions[idx].allocatedBalance *= shrinkRatio;
+            state.positions[idx].sizeRemainingPct = result.updatedPosition.sizeRemainingPct;
+         }
+       }
+       
+       // Update position properties
+       const idx = state.positions.findIndex(pos => pos.id === p.id);
+       if (idx !== -1 && result.action !== 'EXIT') {
+          state.positions[idx].currentPrice = currentPrice;
+          state.positions[idx].unrealizedPnl = isLong ? (currentPrice - state.positions[idx].entryPrice) * state.positions[idx].quantity : (state.positions[idx].entryPrice - currentPrice) * state.positions[idx].quantity;
+          state.positions[idx].maxProfitablePrice = result.updatedPosition.maxProfitablePrice;
+          state.positions[idx].trailingStop = result.updatedPosition.trailingStop;
+          state.positions[idx].trailingStopActive = result.updatedPosition.trailingStopActive;
+       }
+       return;
+     }
+
+     
+     // Original v2 (SMC) logic - Updated with Trailing Stop
+     // Step 1 - Update peak favorable excursion
+     let newMaxProfitable = p.maxProfitablePrice || p.entryPrice;
+     if (isLong) {
+        if (currentPrice > newMaxProfitable) newMaxProfitable = currentPrice;
+     } else {
+        if (currentPrice < newMaxProfitable) newMaxProfitable = currentPrice;
+     }
+
+     // Step 2 - Stepwise Trailing Stop
+     let newTrailingStop = p.trailingStop || p.sl;
+     let trailingStopActive = p.trailingStopActive || false;
+     
+     const hitTp1ForTrail = isLong ? (newMaxProfitable >= p.tp1) : (newMaxProfitable <= p.tp1);
+     const hitTp2ForTrail = isLong ? (newMaxProfitable >= p.tp2) : (newMaxProfitable <= p.tp2);
+
+     if (hitTp2ForTrail) {
+        newTrailingStop = p.tp1;
+        trailingStopActive = true;
+     } else if (hitTp1ForTrail) {
+        newTrailingStop = p.entryPrice;
+        trailingStopActive = true;
+     }
+
+     const currentStop = newTrailingStop;
+     
+     if (isLong) {
+        if (currentPrice <= currentStop) closedReason = trailingStopActive ? 'TS' as any : 'SL';
+        else if (currentPrice >= p.tp3) closedReason = 'TP3';
+     } else {
+        if (currentPrice >= currentStop) closedReason = trailingStopActive ? 'TS' as any : 'SL';
+        else if (currentPrice <= p.tp3) closedReason = 'TP3';
+     }
+
+     if (closedReason) {
+        closePosition({ ...p, currentPrice, unrealizedPnl: pnl }, closedReason);
+     } else {
+        const idx = state.positions.findIndex(pos => pos.id === p.id);
+        if (idx !== -1) {
+           state.positions[idx].currentPrice = currentPrice;
+           state.positions[idx].unrealizedPnl = pnl;
+           state.positions[idx].maxProfitablePrice = newMaxProfitable;
+           state.positions[idx].trailingStop = newTrailingStop;
+           state.positions[idx].trailingStopActive = trailingStopActive;
+        }
+     }
+  });
+
+  // Update coins list prices
+  state.coins.forEach(c => {
+     const ticker = data.find((t: any) => t.s === c.symbol);
+     if (ticker) {
+        c.price = parseFloat(ticker.c);
+     }
+  });
+}
+
+
+let engineInterval: any = null;
+export function startEngine() {
+  if (engineInterval) return;
+  scanMarkets();
+  engineInterval = setInterval(scanMarkets, state.settings.scanInterval * 1000);
+  addTerminalLog("Engine started");
+  if (!ws && !nseInterval) connectWS();
+}
+
+export function stopEngine() {
+  if (engineInterval) clearInterval(engineInterval);
+  engineInterval = null;
+  addTerminalLog("Engine stopped");
+  if (ws) {
+    ws.close();
+    ws = null;
+  }
+  if (nseInterval) {
+    clearInterval(nseInterval);
+    nseInterval = null;
+  }
+}
