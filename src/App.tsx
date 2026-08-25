@@ -196,7 +196,75 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let ws: WebSocket | null = null;
+    let reconnectTimer: any = null;
+
+    const connectDirectWS = () => {
+      try {
+        ws = new WebSocket('wss://stream.binance.com/ws/!miniTicker@arr');
+        ws.onmessage = (event) => {
+          try {
+            const tickers = JSON.parse(event.data);
+            if (Array.isArray(tickers)) {
+              // Update coins list prices in real time
+              setCoins(prevCoins => {
+                let changed = false;
+                const updated = prevCoins.map(coin => {
+                  const t = tickers.find((item: any) => item.s === coin.symbol);
+                  if (t) {
+                    const newPrice = parseFloat(t.c);
+                    if (newPrice !== coin.price) {
+                      changed = true;
+                      return { ...coin, price: newPrice };
+                    }
+                  }
+                  return coin;
+                });
+                return changed ? updated : prevCoins;
+              });
+
+              // Update open position prices & unrealized PnL in real time
+              setPositions(prevPositions => {
+                let changed = false;
+                const updated = prevPositions.map(pos => {
+                  const t = tickers.find((item: any) => item.s === pos.symbol);
+                  if (t) {
+                    const newPrice = parseFloat(t.c);
+                    if (newPrice !== pos.currentPrice) {
+                      changed = true;
+                      const isLong = pos.direction === 'LONG';
+                      const pnl = isLong ? (newPrice - pos.entryPrice) * pos.quantity : (pos.entryPrice - newPrice) * pos.quantity;
+                      return { ...pos, currentPrice: newPrice, unrealizedPnl: pnl };
+                    }
+                  }
+                  return pos;
+                });
+                return changed ? updated : prevPositions;
+              });
+            }
+          } catch (e) {}
+        };
+
+        ws.onclose = () => {
+          reconnectTimer = setTimeout(connectDirectWS, 5000);
+        };
+        ws.onerror = () => {
+          if (ws) ws.close();
+        };
+      } catch (e) {}
+    };
+
+    connectDirectWS();
+    return () => {
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (ws) ws.close();
+    };
+  }, []);
+
+  useEffect(() => {
     const fetchState = async () => {
+      // Pause polling if the tab is in background to save Render bandwidth
+      if (typeof document !== 'undefined' && document.hidden) return;
       try {
         const res = await fetch(`/api/state?activeCoin=${selectedSymbol}`);
         if (res.ok) {
@@ -218,8 +286,19 @@ export default function App() {
     };
     
     fetchState();
-    const interval = setInterval(fetchState, 3000);
-    return () => clearInterval(interval);
+    // 15-second background sync interval (saving 80% Render bandwidth)
+    const interval = setInterval(fetchState, 15000);
+
+    // Refresh immediately when window gains focus
+    const handleFocus = () => fetchState();
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('visibilitychange', handleFocus);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('visibilitychange', handleFocus);
+    };
   }, [selectedSymbol]);
 
   const handleManualClose = async (id: string) => {

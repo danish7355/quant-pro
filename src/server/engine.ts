@@ -156,6 +156,11 @@ async function dispatchTelegramAlert(text: string) {
   }
 }
 
+// In-memory cache for top pairs to avoid re-downloading 500KB 24hr ticker on every scan
+let cachedTopPairs: { symbol: string; price: number; change24h: number }[] = [];
+let lastTopPairsFetch = 0;
+const TOP_PAIRS_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+
 // Dummy fetchers for Node
 async function fetchTopFuturesPairs() {
   if (state.settings.market === 'NSE') {
@@ -166,9 +171,14 @@ async function fetchTopFuturesPairs() {
     ].slice(0, state.settings.coinCount);
   }
   
+  const now = Date.now();
+  if (cachedTopPairs.length > 0 && (now - lastTopPairsFetch) < TOP_PAIRS_CACHE_TTL) {
+    return cachedTopPairs.slice(0, state.settings.coinCount);
+  }
+
   const endpoints = [
-    'https://fapi.binance.com/fapi/v1/ticker/24hr',
     'https://data-api.binance.vision/api/v3/ticker/24hr',
+    'https://fapi.binance.com/fapi/v1/ticker/24hr',
     'https://api.binance.com/api/v3/ticker/24hr',
     'https://api1.binance.com/api/v3/ticker/24hr',
     'https://api2.binance.com/api/v3/ticker/24hr',
@@ -205,18 +215,19 @@ async function fetchTopFuturesPairs() {
   }
 
   try {
-    return data
-      .filter((c: any) => c.symbol.endsWith('USDT'))
-      .sort((a: any, b: any) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
-      .slice(0, state.settings.coinCount)
+    cachedTopPairs = data
+      .filter((c: any) => c.symbol && c.symbol.endsWith('USDT'))
+      .sort((a: any, b: any) => parseFloat(b.quoteVolume || b.volume || 0) - parseFloat(a.quoteVolume || a.volume || 0))
       .map((c: any) => ({
         symbol: c.symbol,
-        price: parseFloat(c.lastPrice),
-        // MEXC returns ratio (0.0981), Binance returns percentage (9.81)
-        change24h: parseFloat(c.priceChangePercent) * (isMexc ? 100 : 1)
+        price: parseFloat(c.lastPrice || c.price || 0),
+        change24h: parseFloat(c.priceChangePercent || 0) * (isMexc ? 100 : 1)
       }));
+    lastTopPairsFetch = Date.now();
+    return cachedTopPairs.slice(0, state.settings.coinCount);
   } catch (e) {
     console.error(e);
+    if (cachedTopPairs.length > 0) return cachedTopPairs.slice(0, state.settings.coinCount);
     return [];
   }
 }
@@ -255,12 +266,12 @@ async function fetchKlines(symbol: string, timeframe: Timeframe) {
   if (binanceTf === '1d') binanceTf = '1d';
   
   const endpoints = [
-    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
-    `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
-    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
-    `https://api1.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
-    `https://api2.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
-    `https://api3.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`
+    `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=210`,
+    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${binanceTf}&limit=210`,
+    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=210`,
+    `https://api1.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=210`,
+    `https://api2.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=210`,
+    `https://api3.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=210`
   ];
 
   let data: any = null;
