@@ -1,0 +1,8 @@
+{
+  "firestore": {
+    "databaseId": "ai-studio-remixcryptofutur-bafc30be-8456-4548-b8c4-ac91463e9dc0",
+    "rules": "firestore.rules",
+    "edition": "ENTERPRISE",
+    "dataAccessMode": "FIRESTORE_NATIVE"
+  }
+}

@@ -1,0 +1,1146 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  TrendingUp, TrendingDown, LayoutDashboard, Settings as SettingsIcon, LineChart, History, ShieldAlert, Terminal,
+  CircleCheck, ChevronRight, RefreshCw, Bell, Sun, Moon, Play, Square, Search, Activity, BarChart2, List, GitPullRequest, Zap, Menu, X
+} from 'lucide-react';
+
+import { auth, loginWithGoogle, logout, saveSettingsToDB, saveStateToDB, db } from './firebase';
+import { doc, getDoc } from 'firebase/firestore';
+import { Timeframe, CoinDetail, Position, TradeLog, AppSettings, EquitySnapshot } from './types';
+import ScannerList from './components/ScannerList';
+import SettingsPanel from './components/SettingsPanel';
+import ActiveTrades from './components/ActiveTrades';
+import TradingChart from './components/TradingChart';
+import PerformancePage from './components/PerformancePage';
+import BacktestLab from './components/BacktestLab';
+import StrategyLab from './components/StrategyLab';
+import RiskCenter from './components/RiskCenter';
+import { runScoringEngine } from './utils/indicators';
+import { manageOpenPositionV3 } from './utils/tradeManager';
+
+
+// Default initial settings
+const INITIAL_SETTINGS: AppSettings = {
+  market: 'CRYPTO',
+  activeStrategy: 'v2',
+  timeframe: '4H',
+  autoTradeThreshold: 60, // Minimum Score for Trade 60 instead of 65
+  coinCount: 20,
+  autoTradeEnabled: true,
+  scanInterval: 300, // 5 minutes default
+  theme: 'dark',
+
+  min24hVolume: 10000000,
+  maxFundingRate: 0.15,
+  maxSpread: 0.3,
+
+  emaFastPeriod: 9,
+  emaSlowPeriod: 55,
+  emaTrendPeriod: 200,
+  emaCrossLookback: 3,
+
+  rsiPeriod: 14,
+  rsiLongMin: 30,
+  rsiLongMax: 65,
+  rsiShortMin: 30,
+  rsiShortMax: 55,
+
+  macdFast: 12,
+  macdSlow: 26,
+  macdSignal: 9,
+  adxPeriod: 14,
+  adxTrendThreshold: 20,
+  superTrendPeriod: 10,
+  superTrendMultiplier: 3.0,
+  volumeMultiplier: 1.5,
+  fibLookback: 100,
+
+  atrPeriod: 14,
+
+  startingBalance: 10000,
+  positionSizePct: 10, // user wants to use only 10%
+  accountRiskPct: 1,
+  leverage: 1, // user said: "i don't want to use leverage" -> means 1x leverage
+  maxConcurrentTrades: 10,
+  dailyLossLimitPct: 3,
+  maxDrawdownPct: 10,
+
+  tp1AtrMultiple: 2.0, // ATR Take Profit
+  tp2AtrMultiple: 3.5,
+  tp3FibLevel: 1.618,
+  slAtrMultiple: 1.5, // ATR Stop Loss
+  minRRRatio: 1.5,
+
+  trailingStopActivation: 'TP1',
+  trailActivationR: 1,
+  timeBasedExitEnabled: true,
+  timeBasedExitCandles: 3,
+
+  telegramBotToken: '',
+  telegramChatId: '',
+  alertOnNewSignal: true,
+  alertOnTradeExecuted: true,
+  alertOnTpHit: true,
+  alertOnSlHit: true,
+  alertOnTsMoved: true,
+  alertOnDailyLossLimit: true,
+  alertOnRangingDetected: false,
+};
+
+// Check local storage for initial values
+const safeGetLocal = (key: string) => {
+  if (typeof window === 'undefined') return null;
+  try {
+    return localStorage.getItem(key);
+  } catch (e) {
+    console.warn(`LocalStorage blocked or failed for ${key}`, e);
+    return null;
+  }
+};
+
+const safeSetLocal = (key: string, value: string) => {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(key, value);
+  } catch (e) {
+    console.warn(`LocalStorage blocked or failed for ${key}`, e);
+  }
+};
+
+const getInitialSettings = (): AppSettings => {
+  const local = safeGetLocal('bt_app_settings');
+  if (local) { try { return { ...INITIAL_SETTINGS, ...JSON.parse(local) }; } catch (e) {} }
+  return INITIAL_SETTINGS;
+};
+
+const getInitialBalance = (): number => {
+  const local = safeGetLocal('bt_demo_balance');
+  if (local) {
+    const parsed = parseFloat(local);
+    if (!isNaN(parsed)) return parsed;
+  }
+  return 10000;
+};
+
+const getInitialPositions = (): Position[] => {
+  const local = safeGetLocal('bt_positions');
+  if (local) { 
+    try { 
+      const parsed = JSON.parse(local) || [];
+      const unique = [];
+      const seen = new Set();
+      for (const pos of parsed) {
+        if (!seen.has(pos.id)) {
+          seen.add(pos.id);
+          unique.push(pos);
+        }
+      }
+      return unique;
+    } catch (e) {} 
+  }
+  return [];
+};
+
+const getInitialTradeLogs = (): TradeLog[] => {
+  const local = safeGetLocal('bt_trade_logs');
+  if (local) { 
+    try { 
+      const parsed = JSON.parse(local) || [];
+      // Deduplicate by ID in case of strict-mode double closures from previous bugs
+      const unique = [];
+      const seen = new Set();
+      for (const log of parsed) {
+        if (!seen.has(log.id)) {
+          seen.add(log.id);
+          unique.push(log);
+        }
+      }
+      return unique;
+    } catch (e) {} 
+  }
+  return [];
+};
+
+const getInitialEquitySnapshots = (): EquitySnapshot[] => {
+  const local = safeGetLocal('bt_equity_snapshots');
+  if (local) { try { return JSON.parse(local) || []; } catch (e) {} }
+  return [];
+};
+
+export default function App() {
+  // --- STATE ---
+
+  const [user, setUser] = useState<any>(null);
+  console.log("App mounted"); const [dataLoaded, setDataLoaded] = useState<boolean>(false);
+  const userRef = useRef<any>(null);
+  const dataLoadedRef = useRef<boolean>(false);
+
+  const [activeTab, setActiveTab] = useState('scanner');
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [settings, setSettings] = useState<AppSettings>(getInitialSettings);
+  
+  // Demo Balance Tracking
+  const [balance, setBalance] = useState(getInitialBalance);
+  const [positions, setPositions] = useState<Position[]>(getInitialPositions);
+  const [tradeLogs, setTradeLogs] = useState<TradeLog[]>(getInitialTradeLogs);
+  const [equitySnapshots, setEquitySnapshots] = useState<EquitySnapshot[]>(getInitialEquitySnapshots);
+  
+  // Market Data Scanner
+  const [coins, setCoins] = useState<CoinDetail[]>([]);
+  const [selectedSymbol, setSelectedSymbol] = useState<'BTCUSDT' | string>('BTCUSDT');
+  const [scanning, setScanning] = useState(false);
+  const [scanTime, setScanTime] = useState<string>('N/A');
+  const [connectionStatus, setConnectionStatus] = useState<'CONNECTED' | 'DISCONNECTED' | 'CONNECTING'>('CONNECTING');
+  const [terminalLogs, setTerminalLogs] = useState<string[]>([]);
+
+  useEffect(() => {
+    // Aggressive emergency deduplication to fix any lingering HMR/localStorage duplicate state issues
+    setPositions(prev => {
+      const seen = new Set();
+      let hasDupes = false;
+      const unique = prev.filter(p => {
+        if (seen.has(p.id)) { hasDupes = true; return false; }
+        seen.add(p.id);
+        return true;
+      });
+      return hasDupes ? unique : prev;
+    });
+    setTradeLogs(prev => {
+      const seen = new Set();
+      let hasDupes = false;
+      const unique = prev.filter(p => {
+        if (seen.has(p.id)) { hasDupes = true; return false; }
+        seen.add(p.id);
+        return true;
+      });
+      return hasDupes ? unique : prev;
+    });
+  }, []);
+
+  // Refs for WebSockets/Loops
+  const wsRef = useRef<WebSocket | null>(null);
+  const scanTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const positionsRef = useRef<Position[]>(positions);
+  const settingsRef = useRef<AppSettings>(settings);
+  const balanceRef = useRef<number>(balance);
+
+  // --- LOCAL STORAGE & FIREBASE HANDLING ---
+
+  useEffect(() => {
+    const unsubscribe = auth.onAuthStateChanged(async (u) => { console.log("onAuthStateChanged:", u);
+      setUser(u);
+      userRef.current = u;
+      if (u) {
+        try {
+          const settingsSnap = await getDoc(doc(db, 'users', u.uid, 'data', 'settings'));
+          if (settingsSnap.exists()) {
+            const data = settingsSnap.data();
+            if (data.settingsStr) {
+              setSettings({ ...INITIAL_SETTINGS, ...JSON.parse(data.settingsStr) });
+            }
+          }
+          const stateSnap = await getDoc(doc(db, 'users', u.uid, 'data', 'state'));
+          if (stateSnap.exists()) {
+            const data = stateSnap.data();
+            if (data.balance !== undefined) setBalance(data.balance);
+            if (data.positionsStr) setPositions(JSON.parse(data.positionsStr));
+            if (data.tradeLogsStr) setTradeLogs(JSON.parse(data.tradeLogsStr));
+            if (data.equitySnapshotsStr) setEquitySnapshots(JSON.parse(data.equitySnapshotsStr));
+          }
+        } catch (e) {
+          console.error(e);
+        }
+      }
+      setDataLoaded(true);
+      dataLoadedRef.current = true;
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    addTerminalLog('📡 Algorithmic Crypto Terminal boot cycle finished. Standby ready.');
+  }, []);
+
+  // Sync state modifications to storage
+  useEffect(() => {
+    safeSetLocal('bt_app_settings', JSON.stringify(settings));
+    settingsRef.current = settings;
+    if (userRef.current && dataLoadedRef.current) saveSettingsToDB(userRef.current.uid, settings);
+  }, [settings]);
+
+  useEffect(() => {
+    safeSetLocal('bt_demo_balance', balance.toString());
+    balanceRef.current = balance;
+    if (userRef.current && dataLoadedRef.current) saveStateToDB(userRef.current.uid, { balance, positions: positionsRef.current, tradeLogs, equitySnapshots });
+  }, [balance]);
+
+  useEffect(() => {
+    positionsRef.current = positions;
+    safeSetLocal('bt_positions', JSON.stringify(positions));
+    if (userRef.current && dataLoadedRef.current) saveStateToDB(userRef.current.uid, { balance: balanceRef.current, positions, tradeLogs, equitySnapshots });
+  }, [positions]);
+
+  useEffect(() => {
+    safeSetLocal('bt_trade_logs', JSON.stringify(tradeLogs));
+    if (userRef.current && dataLoadedRef.current) saveStateToDB(userRef.current.uid, { balance: balanceRef.current, positions: positionsRef.current, tradeLogs, equitySnapshots });
+  }, [tradeLogs]);
+
+  useEffect(() => {
+    safeSetLocal('bt_equity_snapshots', JSON.stringify(equitySnapshots));
+    if (userRef.current && dataLoadedRef.current) saveStateToDB(userRef.current.uid, { balance: balanceRef.current, positions: positionsRef.current, tradeLogs, equitySnapshots });
+  }, [equitySnapshots]);
+
+  // Terminal logging helper
+  const addTerminalLog = (msg: string) => {
+    const timeStr = new Date().toLocaleTimeString(undefined, { hour12: false });
+    setTerminalLogs((prev) => [`[${timeStr}] ${msg}`, ...prev.slice(0, 49)]);
+  };
+
+  // --- TELEGRAM DISPATCH SUITE ---
+  const dispatchTelegramAlert = async (text: string) => {
+    if (!settingsRef.current.telegramBotToken || !settingsRef.current.telegramChatId) return;
+    try {
+      const url = `https://api.telegram.org/bot${settingsRef.current.telegramBotToken}/sendMessage?chat_id=${settingsRef.current.telegramChatId}&text=${encodeURIComponent(text)}&parse_mode=Markdown`;
+      await fetch(url);
+    } catch (e) {
+      console.error('Failed to dispatch telegram signal', e);
+    }
+  };
+
+  // --- SCANNED MARKET DATA FETCHING (BINANCE FUTURES REST) ---
+  const fetchTopFuturesPairs = async () => {
+    if (settingsRef.current.market === 'NSE') {
+      return [
+        { symbol: 'RELIANCE', price: 2950.40, change24h: 1.25 },
+        { symbol: 'HDFCBANK', price: 1640.20, change24h: -0.45 },
+        { symbol: 'TCS', price: 3890.15, change24h: 0.85 },
+        { symbol: 'INFY', price: 1420.50, change24h: 2.10 },
+        { symbol: 'ICICIBANK', price: 1150.30, change24h: -1.15 },
+        { symbol: 'SBIN', price: 780.25, change24h: 0.40 },
+        { symbol: 'BHARTIARTL', price: 1210.60, change24h: 1.50 },
+        { symbol: 'ITC', price: 420.10, change24h: 0.20 },
+        { symbol: 'LT', price: 3560.80, change24h: -0.65 },
+        { symbol: 'BAJFINANCE', price: 6850.30, change24h: 3.12 },
+        { symbol: 'AXISBANK', price: 1120.45, change24h: 0.75 },
+        { symbol: 'KOTAKBANK', price: 1750.80, change24h: -0.25 },
+        { symbol: 'HINDUNILVR', price: 2240.10, change24h: 0.15 },
+        { symbol: 'MARUTI', price: 12500.60, change24h: 1.80 },
+        { symbol: 'TATAMOTORS', price: 950.25, change24h: 2.40 },
+        { symbol: 'SUNPHARMA', price: 1480.90, change24h: 0.55 },
+        { symbol: 'M&M', price: 2150.30, change24h: 1.05 },
+        { symbol: 'HCLTECH', price: 1350.20, change24h: -0.90 },
+        { symbol: 'ASIANPAINT', price: 2850.70, change24h: -1.20 },
+        { symbol: 'TITAN', price: 3420.50, change24h: 0.45 },
+      ].slice(0, settingsRef.current.coinCount);
+    }
+    
+    try {
+      // Query 24h ticker to extract top coins by high volume
+      const response = await fetch('https://api.binance.com/api/v3/ticker/24hr');
+      if (!response.ok) throw new Error('Rest error');
+      const tickers = await response.json();
+
+      // Filter only USDT-margined contracts, sorting by volume
+      const usdtPairs = tickers
+        .filter((ticker: any) => ticker.symbol.endsWith('USDT'))
+        .sort((a: any, b: any) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+        .slice(0, settingsRef.current.coinCount)
+        .map((ticker: any) => ({
+          symbol: ticker.symbol,
+          price: parseFloat(ticker.lastPrice),
+          change24h: parseFloat(ticker.priceChangePercent),
+        }));
+
+      return usdtPairs;
+    } catch (err) {
+      addTerminalLog('⚠️ Binance connection dropped. Simulating offline fallback engine.');
+      // Offline mock fallback data to let app render immediately if fetch fails/CORS is blocked
+      return [
+        { symbol: 'BTCUSDT', price: 68420.50, change24h: 3.42 },
+        { symbol: 'ETHUSDT', price: 3410.20, change24h: -1.25 },
+        { symbol: 'SOLUSDT', price: 154.60, change24h: 8.94 },
+        { symbol: 'BNBUSDT', price: 585.30, change24h: 0.12 },
+        { symbol: 'ADAUSDT', price: 0.485, change24h: -2.31 },
+        { symbol: 'XRPUSDT', price: 0.521, change24h: 1.05 },
+        { symbol: 'DOGEUSDT', price: 0.142, change24h: 4.12 },
+        { symbol: 'AVAXUSDT', price: 29.80, change24h: -0.45 },
+        { symbol: 'DOTUSDT', price: 6.12, change24h: -3.85 },
+        { symbol: 'MATICUSDT', price: 0.655, change24h: 0.54 },
+      ];
+    }
+  };
+
+  const fetchKlines = async (symbol: string, timeframe: Timeframe) => {
+    if (settingsRef.current.market === 'NSE') {
+      // Offline fallback builder with clear trends to trigger EMAs
+      const now = Math.floor(Date.now() / 1000) - 500 * 14400;
+      const arr = [];
+      let lastPrice = 1000; // default
+      if (symbol === 'RELIANCE') lastPrice = 2950;
+      else if (symbol === 'HDFCBANK') lastPrice = 1640;
+      else if (symbol === 'TCS') lastPrice = 3890;
+      else if (symbol === 'INFY') lastPrice = 1420;
+      else if (symbol === 'MARUTI') lastPrice = 12500;
+      else if (symbol === 'BAJFINANCE') lastPrice = 6850;
+      
+      let trendCycle = Math.random() * Math.PI * 2;
+      for (let i = 0; i < 500; i++) {
+        trendCycle += 0.15; // advance oscillator
+        const baseTrend = Math.sin(trendCycle) * lastPrice * 0.02; // 2% cyclical trend
+        const noise = (Math.random() - 0.5) * lastPrice * 0.015; // 1.5% volatility
+        const change = baseTrend + noise;
+        const nextPrice = lastPrice + change;
+        
+        arr.push({
+          time: now + i * 14400,
+          open: lastPrice,
+          high: Math.max(lastPrice, nextPrice) + Math.abs(noise),
+          low: Math.min(lastPrice, nextPrice) - Math.abs(noise),
+          close: nextPrice,
+          volume: Math.random() * 100000 + 10000,
+        });
+        lastPrice = nextPrice;
+      }
+      return arr;
+    }
+
+    // Convert timeframe to Binance formatting
+    let binanceTf = timeframe.toLowerCase();
+    if (binanceTf === '1h') binanceTf = '1h';
+    if (binanceTf === '2h') binanceTf = '2h';
+    if (binanceTf === '4h') binanceTf = '4h';
+    if (binanceTf === '1d') binanceTf = '1d';
+
+    try {
+      const response = await fetch(
+        `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=500`
+      );
+      if (!response.ok) throw new Error();
+      const klines = await response.json();
+
+      return klines.map((k: any) => ({
+        time: Math.floor(k[0] / 1000), // convert to seconds
+        open: parseFloat(k[1]),
+        high: parseFloat(k[2]),
+        low: parseFloat(k[3]),
+        close: parseFloat(k[4]),
+        volume: parseFloat(k[5]),
+      }));
+    } catch (e) {
+      // offline fallback builder with clear trends to trigger EMAs
+      const now = Math.floor(Date.now() / 1000) - 500 * 14400;
+      const arr = [];
+      let lastPrice = symbol === 'BTCUSDT' ? 68000 : symbol === 'ETHUSDT' ? 3400 : 150;
+      let trendCycle = Math.random() * Math.PI * 2;
+      for (let i = 0; i < 500; i++) {
+        trendCycle += 0.15; // advance oscillator
+        const baseTrend = Math.sin(trendCycle) * lastPrice * 0.02; // 2% cyclical trend
+        const noise = (Math.random() - 0.5) * lastPrice * 0.015; // 1.5% volatility
+        const change = baseTrend + noise;
+        const nextPrice = lastPrice + change;
+        
+        arr.push({
+          time: now + i * 14400,
+          open: lastPrice,
+          high: Math.max(lastPrice, nextPrice) + Math.abs(noise),
+          low: Math.min(lastPrice, nextPrice) - Math.abs(noise),
+          close: nextPrice,
+          volume: Math.random() * 10000 + 1000,
+        });
+        lastPrice = nextPrice;
+      }
+      return arr;
+    }
+  };
+
+  const triggerUnifiedScan = async () => {
+    if (scanning) return;
+    setScanning(true);
+    addTerminalLog(`🔄 Initiating composite algorithmic scan over Top ${settingsRef.current.coinCount} pairs...`);
+
+    try {
+      const pairs = await fetchTopFuturesPairs();
+      const finalCoinsList: CoinDetail[] = [];
+
+      for (const pair of pairs) {
+        const candles = await fetchKlines(pair.symbol, settingsRef.current.timeframe);
+        let fundingRate = 0.0001; // default 0.01%
+
+        // Run composite technical scoring checks
+        const results = runScoringEngine(candles, settingsRef.current);
+
+        finalCoinsList.push({
+          symbol: pair.symbol,
+          price: pair.price,
+          change24h: pair.change24h,
+          score: results.score,
+          direction: results.direction,
+          status: results.status,
+          statusReason: results.reason,
+          fundingRate,
+          indicators: results.indicators,
+          gates: results.gates,
+          wmPattern: results.wmPattern,
+          candles,
+        });
+      }
+
+      setCoins(finalCoinsList);
+      setScanTime(new Date().toLocaleTimeString());
+      setScanning(false);
+      addTerminalLog(`⚡ Scan wave complete. Active markers updated.`);
+
+      // Check if auto-trade applies
+      if (settingsRef.current.autoTradeEnabled) {
+        processAutoTradingRules(finalCoinsList);
+      }
+    } catch (err: any) {
+      console.error(err);
+      addTerminalLog(`⚠️ Scan failed: ${err.message || 'Unknown error'}`);
+      setScanning(false);
+    }
+  };
+
+  
+  // --- AUTOMATED FUTURES TRADE EXECUTION ---
+  const processAutoTradingRules = (scannedList: CoinDetail[]) => {
+    const triggers = scannedList.filter((c) => {
+      const hasActive = positionsRef.current.some((p) => p.symbol === c.symbol);
+      const allGatesPassed = c.statusReason === 'All gates passed';
+      return !hasActive && allGatesPassed && c.score >= settingsRef.current.autoTradeThreshold;
+    });
+
+    triggers.forEach(t => {
+      if (positionsRef.current.length < settingsRef.current.maxConcurrentTrades) {
+        openPosition(t);
+      }
+    });
+  };
+
+  const openPosition = (coin: CoinDetail) => {
+    // Use balanceRef.current for accurate back-to-back trades
+    const currentBalance = balanceRef.current;
+    const riskAmt = currentBalance * (settingsRef.current.positionSizePct / 100);
+    
+    // Prevent opening if riskAmt exceeds available balance or is too small
+    if (riskAmt > currentBalance || riskAmt < 5) return;
+
+    const leverage = settingsRef.current.leverage;
+    const posSize = riskAmt * leverage;
+    const qty = posSize / coin.price;
+    const atr = coin.indicators.atr;
+    const slDist = atr * settingsRef.current.slAtrMultiple;
+    const isLong = coin.direction === 'LONG';
+    const sl = isLong ? coin.price - slDist : coin.price + slDist;
+    const tp1 = isLong ? coin.price + atr * settingsRef.current.tp1AtrMultiple : coin.price - atr * settingsRef.current.tp1AtrMultiple;
+    const tp2 = isLong ? coin.price + atr * settingsRef.current.tp2AtrMultiple : coin.price - atr * settingsRef.current.tp2AtrMultiple;
+    const tp3 = isLong 
+      ? tp2 + atr * settingsRef.current.tp2AtrMultiple * settingsRef.current.tp3FibLevel
+      : tp2 - atr * settingsRef.current.tp2AtrMultiple * settingsRef.current.tp3FibLevel;
+    
+    const newPos: Position = {
+      id: Math.random().toString(36).substr(2, 9),
+      symbol: coin.symbol,
+      direction: coin.direction as 'LONG' | 'SHORT',
+      entryPrice: coin.price,
+      currentPrice: coin.price,
+      quantity: qty,
+      leverage,
+      allocatedBalance: riskAmt,
+      tp1, tp2, tp3,
+      sl,
+      trailingStop: null,
+      trailingStopActive: false,
+      entryAtr: atr,
+      timeOpen: new Date().toISOString(),
+      scoreAtEntry: coin.score,
+      unrealizedPnl: 0,
+      realizedPnl: 0,
+      sizeRemainingPct: 100
+    };
+
+    // Optimistically update refs to prevent over-trading in the same loop
+    positionsRef.current = [...positionsRef.current, newPos];
+    balanceRef.current -= riskAmt;
+
+    setPositions(prev => [...prev, newPos]);
+    setBalance(b => b - riskAmt);
+    addTerminalLog(`🟢 OPEN ${newPos.direction} on ${coin.symbol} @ $${coin.price.toLocaleString(undefined, { maximumFractionDigits: 8 })}`);
+    dispatchTelegramAlert(`🚀 OPEN ${newPos.direction} ${coin.symbol}\nEntry: $${coin.price}\nScore: ${coin.score}`);
+  };
+
+  const handleManualClose = (id: string) => {
+    const pos = positionsRef.current.find(p => p.id === id);
+    if (!pos) return;
+    closePosition(pos, 'MANUAL');
+  };
+
+  const closePartialPosition = (pos: Position, reason: TradeLog["exitReason"], partialRatio: number) => {
+    if (!positionsRef.current.some(p => p.id === pos.id)) return;
+    const pnl = pos.unrealizedPnl * partialRatio;
+    const marginFreed = pos.allocatedBalance * partialRatio;
+    balanceRef.current += (marginFreed + pnl);
+    setBalance(b => b + marginFreed + pnl);
+    const log: TradeLog = {
+      id: Math.random().toString(36).substr(2, 9),
+      symbol: pos.symbol,
+      direction: pos.direction,
+      entryPrice: pos.entryPrice,
+      closePrice: pos.currentPrice,
+      leverage: pos.leverage,
+      profit: pnl,
+      pctReturn: (pnl / marginFreed) * 100,
+      exitReason: reason,
+      timeOpen: pos.timeOpen,
+      timeClose: new Date().toISOString(),
+      scoreAtEntry: pos.scoreAtEntry,
+      scoreAtClose: 0
+    };
+    setTradeLogs(prev => [log, ...prev]);
+    setEquitySnapshots(prev => [...prev, { time: new Date().toISOString(), balance: balanceRef.current }]);
+    addTerminalLog(`🔸 PARTIAL CLOSED ${pos.symbol} [${reason}] PNL: $${pnl.toLocaleString(undefined, { maximumFractionDigits: 8 })}`);
+  };
+
+  const closePosition = (pos: Position, reason: TradeLog['exitReason']) => {
+    // Avoid double closing
+    if (!positionsRef.current.some(p => p.id === pos.id)) return;
+    
+    // Optimistically update ref
+    positionsRef.current = positionsRef.current.filter(p => p.id !== pos.id);
+    const profit = pos.unrealizedPnl;
+    balanceRef.current += (pos.allocatedBalance + profit);
+
+    setPositions(prev => prev.filter(p => p.id !== pos.id));
+    setBalance(b => b + pos.allocatedBalance + profit);
+    
+    const log: TradeLog = {
+      id: Math.random().toString(36).substr(2, 9),
+      symbol: pos.symbol,
+      direction: pos.direction,
+      entryPrice: pos.entryPrice,
+      closePrice: pos.currentPrice,
+      leverage: pos.leverage,
+      profit,
+      pctReturn: (profit / pos.allocatedBalance) * 100,
+      exitReason: reason,
+      timeOpen: pos.timeOpen,
+      timeClose: new Date().toISOString(),
+      scoreAtEntry: pos.scoreAtEntry,
+      scoreAtClose: 0
+    };
+    setTradeLogs(prev => [log, ...prev]);
+    setEquitySnapshots(prev => [...prev, { time: new Date().toISOString(), balance: balanceRef.current }]);
+    addTerminalLog(`🔴 CLOSED ${pos.symbol} [${reason}] PNL: $${profit.toLocaleString(undefined, { maximumFractionDigits: 8 })}`);
+    
+    // Telegram alert on close
+    const emoji = profit >= 0 ? '🟢' : '🔴';
+    dispatchTelegramAlert(`${emoji} CLOSED ${pos.direction} ${pos.symbol}
+Reason: ${reason}
+Entry: $${pos.entryPrice}
+Close: $${pos.currentPrice}
+PNL: $${profit.toFixed(2)}`);
+  };
+
+
+
+  const handleResetBalance = () => {
+    setBalance(settings.startingBalance);
+    setPositions([]);
+    setTradeLogs([]);
+    setEquitySnapshots([]);
+  };
+
+  const handleResetSettings = () => {
+    setSettings(INITIAL_SETTINGS);
+  };
+
+  // Real WebSocket to update prices for active positions and scanner list
+  useEffect(() => {
+    let ws: WebSocket;
+    let reconnectTimeout: NodeJS.Timeout;
+
+    const connectWS = () => {
+      if (settingsRef.current.market === 'NSE') {
+        const interval = setInterval(() => {
+          // generate mock data for current positions and coins
+          const mockData = [...positionsRef.current.map(p => p.symbol), ...coins.map(c => c.symbol)]
+            .filter((v, i, a) => a.indexOf(v) === i) // unique
+            .map(symbol => {
+               const pos = positionsRef.current.find(p => p.symbol === symbol);
+               const c = coins.find(c => c.symbol === symbol);
+               const currentPrice = pos ? pos.currentPrice : (c ? c.price : 1000);
+               const variation = currentPrice * (Math.random() * 0.002 - 0.001); // 0.1% volatility
+               return { 
+                 s: symbol, 
+                 c: (currentPrice + variation).toString(),
+                 o: (currentPrice).toString() // mock open
+               };
+            });
+          handleWsData(mockData);
+        }, 3000);
+        
+        // Mock the ws object for the cleanup function
+        ws = {
+           close: () => clearInterval(interval)
+        } as any;
+        return;
+      }
+
+      ws = new WebSocket('wss://stream.binance.com/ws/!miniTicker@arr');
+
+      ws.onmessage = (event) => {
+        let data;
+        try {
+          data = JSON.parse(event.data);
+        } catch (e) {
+          return;
+        }
+        handleWsData(data);
+      };
+
+      ws.onerror = (err) => {
+        console.warn("Binance WS error");
+        ws.close();
+      };
+
+      ws.onclose = () => {
+        console.log("Binance WS closed, reconnecting in 3s...");
+        reconnectTimeout = setTimeout(connectWS, 3000);
+      };
+    };
+
+    const handleWsData = (data: any[]) => {
+        if (!Array.isArray(data)) return;
+
+        // Process closures synchronously based on latest prices
+        const currentPositions = positionsRef.current;
+        let positionsChanged = false;
+        
+        currentPositions.forEach(p => {
+           const ticker = data.find((t: any) => t.s === p.symbol);
+           let currentPrice = p.currentPrice;
+           let trailStop = p.trailingStop;
+           
+           if (ticker) {
+              currentPrice = parseFloat(ticker.c);
+           }
+           
+           const isLong = p.direction === 'LONG';
+           let closedReason: TradeLog['exitReason'] | null = null;
+           let pnl = isLong ? (currentPrice - p.entryPrice) * p.quantity : (p.entryPrice - currentPrice) * p.quantity;
+           
+           if (settingsRef.current.activeStrategy === 'v3' || settingsRef.current.activeStrategy === 'climax_reversal') {
+             // For v3, rely on manageOpenPositionV3 from tradeManager
+             // We'll update the state later in setPositions using the same logic.
+             // Here we only check for full EXIT to call closePosition synchronously.
+             // We need elapsed hours
+             const timeOpen = new Date(p.timeOpen).getTime();
+             const elapsedHours = (Date.now() - timeOpen) / (1000 * 60 * 60);
+             const result = manageOpenPositionV3(
+               p, 
+               { open: currentPrice, high: currentPrice, low: currentPrice, close: currentPrice },
+               p.entryAtr,
+               elapsedHours,
+               settingsRef.current.timeBasedExitCandles // assuming 1 candle = 1 hour or similar
+             );
+             if (result.action === 'EXIT') {
+               closePosition({ ...p, currentPrice, unrealizedPnl: pnl }, result.reason as any);
+             } else if (result.action.startsWith('PARTIAL') && result.partialRatio) {
+               // handle partial exit
+               // We don't remove from positions, just update balance and log it.
+               // We also need to update the position's quantity and allocated balance so it doesn't get double counted.
+               // But wait, setPositions handles the state update of sizeRemainingPct via the map loop below.
+               // However, we also need to adjust quantity and allocatedBalance!
+               // I will handle the state update below, but here I can log the partial close.
+               closePartialPosition({ ...p, currentPrice, unrealizedPnl: pnl }, result.reason as any, result.partialRatio);
+             }
+             return;
+           }
+
+           // Original v2 (SMC) logic
+           if (ticker) {
+              if (p.direction === 'LONG' && p.trailingStopActive && p.entryAtr) {
+                 const potentialTrail = currentPrice - (p.entryAtr * settingsRef.current.trailActivationR);
+                 if (!trailStop || potentialTrail > trailStop) trailStop = potentialTrail;
+              } else if (p.direction === 'SHORT' && p.trailingStopActive && p.entryAtr) {
+                 const potentialTrail = currentPrice + (p.entryAtr * settingsRef.current.trailActivationR);
+                 if (!trailStop || potentialTrail < trailStop) trailStop = potentialTrail;
+              }
+           }
+           
+           if (isLong) {
+              if (currentPrice <= p.sl) closedReason = 'SL';
+              else if (currentPrice >= p.tp3) closedReason = 'TP3';
+              else if (trailStop && currentPrice <= trailStop) closedReason = 'TS';
+           } else {
+              if (currentPrice >= p.sl) closedReason = 'SL';
+              else if (currentPrice <= p.tp3) closedReason = 'TP3';
+              else if (trailStop && currentPrice >= trailStop) closedReason = 'TS';
+           }
+           
+           if (closedReason) {
+              closePosition({ ...p, currentPrice, unrealizedPnl: pnl }, closedReason);
+           }
+        });
+
+        // Update positions
+        setPositions(prev => {
+          let changed = false;
+          const next = prev.map(p => {
+            const ticker = data.find((t: any) => t.s === p.symbol);
+            if (ticker) {
+              const newPrice = parseFloat(ticker.c);
+              if (newPrice !== p.currentPrice) {
+                changed = true;
+                const isLong = p.direction === 'LONG';
+                const pnl = isLong ? (newPrice - p.entryPrice) * p.quantity : (p.entryPrice - newPrice) * p.quantity;
+                
+                if (settingsRef.current.activeStrategy === 'v3' || settingsRef.current.activeStrategy === 'climax_reversal') {
+                   const timeOpen = new Date(p.timeOpen).getTime();
+                   const elapsedHours = (Date.now() - timeOpen) / (1000 * 60 * 60);
+                   const result = manageOpenPositionV3(
+                     p, 
+                     { open: newPrice, high: newPrice, low: newPrice, close: newPrice },
+                     p.entryAtr,
+                     elapsedHours,
+                     settingsRef.current.timeBasedExitCandles
+                   );
+                   
+                   let updatedPos = result.updatedPosition;
+                   if (updatedPos.sizeRemainingPct !== p.sizeRemainingPct) {
+                     // Need to shrink quantity and allocatedBalance
+                     const shrinkRatio = updatedPos.sizeRemainingPct / p.sizeRemainingPct;
+                     updatedPos.quantity = updatedPos.quantity * shrinkRatio;
+                     updatedPos.allocatedBalance = updatedPos.allocatedBalance * shrinkRatio;
+                     // also shrink unrealizedPnl so the percentage makes sense? It will be recomputed on next tick.
+                   }
+                   
+                   return { ...updatedPos, currentPrice: newPrice, unrealizedPnl: pnl * (updatedPos.sizeRemainingPct / 100) };
+                }
+
+                let newMaxProfitable = p.maxProfitablePrice || p.entryPrice;
+                let newTrailStop = p.trailingStop;
+                let newTrailingStopActive = p.trailingStopActive;
+
+                if (isLong) {
+                  if (newPrice > newMaxProfitable) {
+                    newMaxProfitable = newPrice;
+                  }
+                  if (settingsRef.current.trailingStopActivation === 'TP1' && newPrice >= p.tp1) {
+                     newTrailingStopActive = true;
+                  } else if (settingsRef.current.trailingStopActivation === 'TP2' && newPrice >= p.tp2) {
+                     newTrailingStopActive = true;
+                  }
+                  
+                  if (newTrailingStopActive) {
+                    const potentialTrail = newMaxProfitable - (p.entryAtr * settingsRef.current.trailActivationR);
+                    if (!newTrailStop || potentialTrail > newTrailStop) {
+                       newTrailStop = potentialTrail;
+                    }
+                  }
+                } else {
+                  if (newPrice < newMaxProfitable) {
+                     newMaxProfitable = newPrice;
+                  }
+                  if (settingsRef.current.trailingStopActivation === 'TP1' && newPrice <= p.tp1) {
+                     newTrailingStopActive = true;
+                  } else if (settingsRef.current.trailingStopActivation === 'TP2' && newPrice <= p.tp2) {
+                     newTrailingStopActive = true;
+                  }
+                  
+                  if (newTrailingStopActive) {
+                     const potentialTrail = newMaxProfitable + (p.entryAtr * settingsRef.current.trailActivationR);
+                     if (!newTrailStop || potentialTrail < newTrailStop) {
+                        newTrailStop = potentialTrail;
+                     }
+                  }
+                }
+
+                return { ...p, currentPrice: newPrice, unrealizedPnl: pnl, maxProfitablePrice: newMaxProfitable, trailingStop: newTrailStop, trailingStopActive: newTrailingStopActive };
+              }
+            }
+            return p;
+          });
+          return changed ? next : prev;
+        });
+
+        // Update coins (scanner list)
+        setCoins(prev => {
+          let changed = false;
+          const next = prev.map(c => {
+            const ticker = data.find((t: any) => t.s === c.symbol);
+            if (ticker) {
+               const newPrice = parseFloat(ticker.c);
+               const openPrice = parseFloat(ticker.o);
+               const newChange = ((newPrice - openPrice) / openPrice) * 100;
+               if (newPrice !== c.price || Math.abs(newChange - c.change24h) > 0.01) {
+                  changed = true;
+                  return { ...c, price: newPrice, change24h: newChange };
+               }
+            }
+            return c;
+          });
+          return changed ? next : prev;
+        });
+      };
+
+    connectWS();
+
+    return () => {
+      clearTimeout(reconnectTimeout);
+      if (ws) {
+        ws.onclose = null; // Prevent reconnect on unmount
+        if (typeof ws.close === 'function') ws.close();
+      }
+    };
+  }, [settings.market]);
+
+  const [engineRunning, setEngineRunning] = useState(true);
+
+  // Main scanner loop
+  useEffect(() => {
+    let interval;
+    if (engineRunning) {
+      triggerUnifiedScan();
+      interval = setInterval(() => {
+        triggerUnifiedScan();
+      }, settings.scanInterval * 1000);
+    }
+    return () => clearInterval(interval);
+  }, [engineRunning, settings.scanInterval, settings.market]);
+
+  const currentCoinDetail = coins.find(c => c.symbol === selectedSymbol) || coins[0];
+  const totalAccountValue = balance + positions.reduce((acc, p) => acc + p.allocatedBalance + p.unrealizedPnl, 0);
+
+  const TABS = [
+    { id: 'dashboard', label: '1. Dashboard', icon: LayoutDashboard },
+    { id: 'scanner', label: '2. Scanner', icon: List },
+    { id: 'positions', label: '3. Trade Manager', icon: Activity },
+    { id: 'backtest', label: '4. Backtest Engine', icon: LineChart },
+    { id: 'history', label: '5. Analytics', icon: History },
+    { id: 'strategy_lab', label: '6. Strategy Lab', icon: GitPullRequest },
+    { id: 'risk_center', label: '7. Risk Center', icon: ShieldAlert },
+    { id: 'settings', label: '8. Settings', icon: SettingsIcon },
+    { id: 'logs', label: '9. Terminal Logs', icon: Terminal },
+  ];
+
+  return (
+    <div className="flex h-screen bg-[#0E1117] text-gray-200 font-mono overflow-hidden">
+      {/* Mobile Sidebar Overlay */}
+      {sidebarOpen && (
+        <div 
+          className="fixed inset-0 bg-black/50 z-40 md:hidden"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+
+      {/* Sidebar */}
+      <div className={`w-64 bg-[#161B22] border-r border-[#30363D] flex flex-col absolute inset-y-0 left-0 z-50 transform transition-transform duration-200 ease-in-out md:relative md:translate-x-0 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+        <div className="p-4 border-b border-[#30363D] flex items-center justify-between">
+          <div>
+            <h1 className="text-sm font-bold text-emerald-400 flex items-center gap-2">
+              <Zap size={16} /> QUANT-STACK V1
+            </h1>
+            <div className="text-[10px] text-gray-500 mt-1">ARM Oracle VM Build</div>
+          </div>
+          <button className="md:hidden text-gray-400 hover:text-white" onClick={() => setSidebarOpen(false)}>
+            <X size={20} />
+          </button>
+        </div>
+        
+        <div className="flex-1 overflow-y-auto py-4">
+          <nav className="space-y-1 px-2">
+            {TABS.map(t => {
+              const Icon = t.icon;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => {
+                    setActiveTab(t.id);
+                    setSidebarOpen(false);
+                  }}
+                  className={`w-full flex items-center gap-3 px-3 py-2 text-xs rounded-md transition-colors ${
+                    activeTab === t.id 
+                      ? 'bg-blue-500/10 text-blue-400 font-bold' 
+                      : 'text-gray-400 hover:bg-[#21262D] hover:text-gray-200'
+                  }`}
+                >
+                  <Icon size={14} />
+                  {t.label}
+                </button>
+              );
+            })}
+          </nav>
+        </div>
+
+        <div className="p-4 border-t border-[#30363D]">
+          <button
+            onClick={() => setEngineRunning(!engineRunning)}
+            className={`w-full flex items-center justify-center gap-2 px-4 py-2 rounded text-xs font-bold transition-colors ${
+              engineRunning ? 'bg-rose-500/20 text-rose-400 hover:bg-rose-500/30' : 'bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30'
+            }`}
+          >
+            {engineRunning ? <Square size={14} /> : <Play size={14} />}
+            {engineRunning ? 'STOP ENGINE' : 'START ENGINE'}
+          </button>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="flex-1 flex flex-col h-screen overflow-hidden">
+        {/* Header */}
+        <header className="h-14 border-b border-[#30363D] bg-[#0E1117] flex items-center px-4 md:px-6 justify-between shrink-0">
+          <div className="flex items-center gap-3">
+            <button className="md:hidden text-gray-400 hover:text-white" onClick={() => setSidebarOpen(true)}>
+              <Menu size={20} />
+            </button>
+            <h2 className="text-sm font-bold uppercase tracking-wider text-gray-300">
+              {TABS.find(t => t.id === activeTab)?.label}
+            </h2>
+          </div>
+          <div className="flex items-center gap-4 text-xs">
+             <span className="flex items-center gap-2">
+                <span className={`w-2 h-2 rounded-full ${engineRunning ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`}></span>
+                {engineRunning ? 'ENGINE ACTIVE' : 'ENGINE OFFLINE'}
+             </span>
+             <span className="text-gray-500">WS: LIVE</span>
+          </div>
+        </header>
+
+        {/* Scrollable Area */}
+        <main className="flex-1 overflow-auto p-6">
+          {activeTab === 'scanner' && (
+            <div className="space-y-4 max-w-7xl mx-auto">
+              <div className="flex items-center justify-between">
+                <div className="text-xs text-gray-500">
+                  Total Pairs: {coins.length} | Last Scan: {scanTime}
+                </div>
+              </div>
+              <ScannerList 
+                  coins={coins} 
+                  selectedSymbol={selectedSymbol}
+                  onSelectCoin={setSelectedSymbol}
+                  isLoading={scanning}
+                  onManualScan={triggerUnifiedScan}
+                  autoTradeThreshold={settings.autoTradeThreshold}
+              />
+            </div>
+          )}
+          {activeTab === 'settings' && (
+            <SettingsPanel 
+                settings={settings} 
+                onUpdateSettings={setSettings} 
+                onResetBalance={handleResetBalance}
+                onResetSettings={handleResetSettings}
+            />
+          )}
+
+          {activeTab === 'dashboard' && (
+            <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+              <div className="xl:col-span-2 space-y-6">
+                <ActiveTrades positions={positions} onManualClose={handleManualClose} />
+                {currentCoinDetail ? (
+                  <TradingChart coin={currentCoinDetail} activePosition={positions.find((p) => p.symbol === currentCoinDetail.symbol)} />
+                ) : (
+                  <div className="h-96 flex flex-col items-center justify-center bg-gray-900 border border-gray-800 rounded-xl relative p-6">
+                    <RefreshCw className="w-10 h-10 stroke-indigo-400 mb-2 animate-spin" />
+                    <span className="text-gray-400 text-sm font-semibold uppercase tracking-wider">Synchronizing market candles loop...</span>
+                  </div>
+                )}
+              </div>
+              <div className="space-y-6">
+                 <div className="bg-[#05080f] border border-gray-800 rounded-xl p-4 shadow-inner">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest flex items-center">
+                      <Terminal className="w-3.5 h-3.5 mr-1.5" /> Quant Event Log Output Console
+                    </span>
+                  </div>
+                  <div className="h-96 overflow-y-auto font-mono text-[10px] text-gray-400 space-y-1.5 divide-y divide-gray-900/40 pr-2">
+                    {terminalLogs.length === 0 ? (
+                      <span className="text-gray-600">Console empty. Boot stream ready.</span>
+                    ) : (
+                      terminalLogs.map((logStr, index) => (
+                        <div key={index} className="pt-1.5">{logStr}</div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'backtest' && (
+            <BacktestLab settings={settings} coins={coins} />
+          )}
+
+          {activeTab === 'strategy_lab' && (
+            <StrategyLab settings={settings} onUpdateSettings={setSettings} />
+          )}
+
+          {activeTab === 'risk_center' && (
+            <RiskCenter
+              settings={settings}
+              onUpdateSettings={setSettings}
+              balance={balance}
+              positions={positions}
+              onManualClose={handleManualClose}
+              setEngineRunning={setEngineRunning}
+            />
+          )}
+
+          {activeTab === 'history' && (
+             <PerformancePage
+              logs={tradeLogs}
+              snapshots={equitySnapshots}
+              currentBalance={totalAccountValue}
+              startingBalance={settings.startingBalance}
+            />
+          )}
+          
+          {activeTab === 'chart' && (
+            <div className="h-full">
+              {currentCoinDetail ? (
+                <TradingChart coin={currentCoinDetail} activePosition={positions.find((p) => p.symbol === currentCoinDetail.symbol)} />
+              ) : (
+                <div className="h-full flex flex-col items-center justify-center bg-[#05080f] border border-[#30363D] rounded-xl relative p-6">
+                  <RefreshCw className="w-10 h-10 stroke-indigo-400 mb-2 animate-spin" />
+                  <span className="text-gray-400 text-sm font-semibold uppercase tracking-wider">Synchronizing market candles loop...</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {activeTab === 'positions' && (
+            <div className="h-full">
+               <ActiveTrades positions={positions} onManualClose={handleManualClose} />
+            </div>
+          )}
+
+          {activeTab === 'logs' && (
+             <div className="h-full bg-[#05080f] border border-gray-800 rounded-xl p-4 shadow-inner flex flex-col">
+              <div className="flex items-center justify-between mb-4">
+                <span className="text-[12px] font-bold text-indigo-400 uppercase tracking-widest flex items-center">
+                  <Terminal className="w-4 h-4 mr-2" /> Quant Event Log Output Console
+                </span>
+              </div>
+              <div className="flex-1 overflow-y-auto font-mono text-[11px] text-gray-400 space-y-2 divide-y divide-gray-900/40 pr-2">
+                {terminalLogs.length === 0 ? (
+                  <span className="text-gray-600">Console empty. Boot stream ready.</span>
+                ) : (
+                  terminalLogs.map((logStr, index) => (
+                    <div key={index} className="pt-2">{logStr}</div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+        </main>
+      </div>
+    </div>
+  );
+}

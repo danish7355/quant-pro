@@ -831,7 +831,7 @@ export function runScoringEngine(
   }
 
   return {
-    score: Math.round(confidence * 100),
+    score: Math.round(confidence * 100) * (finalDir === 'SHORT' ? -1 : 1),
     direction: finalDir,
     status: regime.label,
     reason: finalReason,
