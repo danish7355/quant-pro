@@ -1,31 +1,41 @@
 import express from "express";
 import path from "path";
 import compression from "compression";
-import { state, startEngine, stopEngine, closeManualPosition, loadStateFromFirebase, scheduleStateSync } from "./src/server/engine";
+import { state, stateVersion, startEngine, stopEngine, closeManualPosition, loadStateFromFirebase, scheduleStateSync } from "./src/server/engine";
 
 async function startServer() {
   const app = express();
   const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 
-  // Body parser
-  app.use(compression());
+  // Gzip compression for all HTTP responses (reduces response size by 75-85%)
+  app.use(compression({
+    level: 6,
+    threshold: 512
+  }));
   app.use(express.json());
 
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
 
-  // Backend Engine API
+  // Backend Engine API with 304 Not Modified support
   app.get("/api/state", (req, res) => {
+    const clientVersion = req.query.v ? parseInt(req.query.v as string) : -1;
     const activeCoin = req.query.activeCoin as string;
     
-    // Bandwidth Optimization: Only send the massive 'candles' array for the active coin being viewed
+    // If client already has the latest state version, return 304 with 0 bytes payload!
+    if (clientVersion > 0 && clientVersion === stateVersion) {
+      return res.status(304).end();
+    }
+
+    res.setHeader("Cache-Control", "no-cache");
+    
     const optimizedState = {
       ...state,
+      version: stateVersion,
       coins: state.coins.map(c => {
         if (c.symbol === activeCoin) return c;
-        
-        // Strip out the candles array for non-active coins to save ~2.3MB per request
+        // Strip out the candles array for non-active coins to save ~2MB per request
         const { candles, ...rest } = c;
         return { ...rest, candles: [] };
       })
@@ -60,7 +70,7 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  // Start engine automatically on server boot
+  // Start engine automatically on server boot with state restoration
   await loadStateFromFirebase();
   startEngine();
 
@@ -73,8 +83,22 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
+    
+    // Cache static assets (JS, CSS, images) for 7 days to eliminate repeat bundle downloads
+    app.use(express.static(distPath, {
+      maxAge: "7d",
+      immutable: true,
+      setHeaders: (res, filePath) => {
+        if (filePath.endsWith(".html")) {
+          res.setHeader("Cache-Control", "no-cache, must-revalidate");
+        } else {
+          res.setHeader("Cache-Control", "public, max-age=604800, immutable");
+        }
+      }
+    }));
+
     app.get("*all", (req, res) => {
+      res.setHeader("Cache-Control", "no-cache, must-revalidate");
       res.sendFile(path.join(distPath, "index.html"));
     });
   }

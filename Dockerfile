@@ -20,8 +20,9 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --omit=dev
 
-# Copy the built application from the builder stage
+# Copy the built application and firebase config from the builder stage
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/firebase-applet-config.json ./firebase-applet-config.json
 
 # Set permissions and expose the port
 EXPOSE 3000

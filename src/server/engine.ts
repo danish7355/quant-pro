@@ -1,72 +1,123 @@
 import WebSocket from 'ws';
+import * as fs from 'fs';
+import * as path from 'path';
 import { CoinDetail, Position, TradeLog, AppSettings, EquitySnapshot, Timeframe } from '../types';
 import { runScoringEngine } from '../utils/indicators';
 import { manageOpenPositionV3 } from '../utils/tradeManager';
 import { db } from './firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 
+export let stateVersion = 1;
+export function bumpStateVersion() {
+  stateVersion = (stateVersion + 1) % 10000000;
+}
 
-// Firebase Sync
-export async function loadStateFromFirebase() {
-  if (!db) return;
+const DATA_DIR = path.join(process.cwd(), 'data');
+const STATE_FILE = path.join(DATA_DIR, 'state.json');
+
+function ensureDataDir() {
   try {
-    const docSnap = await getDoc(doc(db, "bot", "state"));
-    if (docSnap.exists()) {
-      const data = docSnap.data();
-      if (data && data.stateStr) {
-        const loadedState = JSON.parse(data.stateStr);
-        if (loadedState.settings) {
-          state.settings = { ...state.settings, ...loadedState.settings };
-        }
-        if (typeof loadedState.balance === 'number') {
-          state.balance = loadedState.balance;
-        }
-        if (Array.isArray(loadedState.positions)) {
-          state.positions = loadedState.positions;
-        }
-        if (Array.isArray(loadedState.tradeLogs)) {
-          state.tradeLogs = loadedState.tradeLogs;
-        }
-        if (Array.isArray(loadedState.equitySnapshots)) {
-          state.equitySnapshots = loadedState.equitySnapshots;
-        }
-        if (Array.isArray(loadedState.terminalLogs)) {
-          state.terminalLogs = loadedState.terminalLogs;
-        }
-        console.log("[ENGINE] State loaded from Firebase.");
-      }
-    } else {
-      console.log("[ENGINE] No Firebase state found. Using default.");
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
     }
-  } catch (e) {
-    console.error("[ENGINE] Failed to load state from Firebase:", e);
+  } catch (e) {}
+}
+
+function applyLoadedState(loadedState: any) {
+  if (!loadedState) return;
+  if (loadedState.settings) {
+    state.settings = { ...state.settings, ...loadedState.settings };
+  }
+  if (typeof loadedState.balance === 'number') {
+    state.balance = loadedState.balance;
+  }
+  if (Array.isArray(loadedState.positions)) {
+    state.positions = loadedState.positions;
+  }
+  if (Array.isArray(loadedState.tradeLogs)) {
+    state.tradeLogs = loadedState.tradeLogs;
+  }
+  if (Array.isArray(loadedState.equitySnapshots)) {
+    state.equitySnapshots = loadedState.equitySnapshots;
+  }
+  if (Array.isArray(loadedState.terminalLogs)) {
+    state.terminalLogs = loadedState.terminalLogs;
+  }
+  bumpStateVersion();
+}
+
+// Dual Firebase Cloud & Local Disk State Restoration
+export async function loadStateFromFirebase() {
+  let loaded = false;
+
+  // 1. Try loading from Firestore first
+  if (db) {
+    try {
+      const docSnap = await getDoc(doc(db, "bot", "state"));
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data && data.stateStr) {
+          const loadedState = JSON.parse(data.stateStr);
+          applyLoadedState(loadedState);
+          loaded = true;
+          console.log("[ENGINE] State restored from Cloud Firestore.");
+        }
+      }
+    } catch (e) {
+      console.error("[ENGINE] Firestore restore error:", e);
+    }
+  }
+
+  // 2. Fallback to local disk file if not loaded from Firestore
+  if (!loaded) {
+    try {
+      if (fs.existsSync(STATE_FILE)) {
+        const fileContent = fs.readFileSync(STATE_FILE, 'utf-8');
+        const loadedState = JSON.parse(fileContent);
+        applyLoadedState(loadedState);
+        console.log("[ENGINE] State restored from local disk backup.");
+      }
+    } catch(e) {
+      console.warn("[ENGINE] No local state file found, using defaults.");
+    }
   }
 }
 
 let syncTimeout: any = null;
 export function scheduleStateSync() {
-  if (!db) return;
+  bumpStateVersion();
   if (syncTimeout) return;
   syncTimeout = setTimeout(async () => {
     syncTimeout = null;
+    const persistentState = {
+      settings: state.settings,
+      balance: state.balance,
+      positions: state.positions,
+      tradeLogs: state.tradeLogs.slice(0, 100),
+      equitySnapshots: state.equitySnapshots.slice(-100),
+      terminalLogs: state.terminalLogs.slice(0, 30)
+    };
+
+    // 1. Local disk persistence
     try {
-      // Persist only necessary bot state without large transient scanner candles
-      const persistentState = {
-        settings: state.settings,
-        balance: state.balance,
-        positions: state.positions,
-        tradeLogs: state.tradeLogs.slice(0, 100),
-        equitySnapshots: state.equitySnapshots.slice(-100),
-        terminalLogs: state.terminalLogs.slice(0, 30)
-      };
-      await setDoc(doc(db, "bot", "state"), {
-        stateStr: JSON.stringify(persistentState),
-        updatedAt: Date.now()
-      });
+      ensureDataDir();
+      fs.writeFileSync(STATE_FILE, JSON.stringify(persistentState, null, 2), 'utf-8');
     } catch(e) {
-      console.error("[ENGINE] Failed to sync state to Firebase:", e);
+      console.error("[ENGINE] Failed to save state to local disk:", e);
     }
-  }, 2000);
+
+    // 2. Cloud Firestore persistence
+    if (db) {
+      try {
+        await setDoc(doc(db, "bot", "state"), {
+          stateStr: JSON.stringify(persistentState),
+          updatedAt: Date.now()
+        });
+      } catch(e) {
+        console.error("[ENGINE] Failed to sync state to Firebase:", e);
+      }
+    }
+  }, 1000);
 }
 
 // Global State

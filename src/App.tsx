@@ -261,14 +261,28 @@ export default function App() {
     };
   }, []);
 
+  const lastVersionRef = useRef<number>(-1);
+
+  useEffect(() => {
+    lastVersionRef.current = -1; // Reset version when active coin changes to fetch fresh candles
+  }, [selectedSymbol]);
+
   useEffect(() => {
     const fetchState = async () => {
       // Pause polling if the tab is in background to save Render bandwidth
       if (typeof document !== 'undefined' && document.hidden) return;
       try {
-        const res = await fetch(`/api/state?activeCoin=${selectedSymbol}`);
+        const res = await fetch(`/api/state?v=${lastVersionRef.current}&activeCoin=${selectedSymbol}`);
+        if (res.status === 304) {
+          // State has not changed: 0 bytes transferred
+          setConnectionStatus('CONNECTED');
+          return;
+        }
         if (res.ok) {
           const data = await res.json();
+          if (typeof data.version === 'number') {
+            lastVersionRef.current = data.version;
+          }
           setSettings(data.settings);
           setBalance(data.balance);
           setPositions(data.positions);
@@ -290,7 +304,10 @@ export default function App() {
     const interval = setInterval(fetchState, 15000);
 
     // Refresh immediately when window gains focus
-    const handleFocus = () => fetchState();
+    const handleFocus = () => {
+      lastVersionRef.current = -1;
+      fetchState();
+    };
     window.addEventListener('focus', handleFocus);
     window.addEventListener('visibilitychange', handleFocus);
 
