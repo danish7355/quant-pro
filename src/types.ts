@@ -7,7 +7,7 @@ export type Timeframe = '1m' | '5m' | '15m' | '30m' | '1H' | '2H' | '4H' | '1D';
 
 export type SignalDirection = 'LONG' | 'SHORT' | 'NEUTRAL';
 
-export type CoinStatus = 'STRONG_TREND' | 'WEAK_TREND' | 'TRANSITION' | 'RANGE' | 'UNSAFE' | 'TRENDING' | 'RANGING' | 'CHOPPY';
+export type CoinStatus = 'STRONG_TREND' | 'WEAK_TREND' | 'TRANSITION' | 'RANGE' | 'UNSAFE' | 'TRENDING' | 'RANGING' | 'CHOPPY' | 'CLIMAX_REVERSAL' | 'CLIMAX_BUILDING';
 
 export interface IndicatorDetails {
   emaFast: number;

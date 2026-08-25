@@ -138,6 +138,20 @@ export default function ScannerList({
         </span>
       );
     }
+    if (status === 'CLIMAX_REVERSAL') {
+      return (
+        <span className="px-2 py-0.5 rounded bg-red-500/20 text-red-400 text-[10px] uppercase font-bold tracking-wider border border-red-500/30 animate-pulse">
+          🔥 CLIMAX REVERSAL
+        </span>
+      );
+    }
+    if (status === 'CLIMAX_BUILDING') {
+      return (
+        <span className="px-2 py-0.5 rounded bg-orange-500/15 text-orange-400 text-[10px] uppercase font-bold tracking-wider border border-orange-500/25">
+          ⚡ CLIMAX BUILDING
+        </span>
+      );
+    }
     return (
       <span className="px-2 py-0.5 rounded bg-gray-800 text-gray-400 text-[10px] uppercase font-bold tracking-wider">
         {status.replace('_', ' ')}

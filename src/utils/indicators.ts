@@ -692,9 +692,9 @@ export function runScoringEngine(
 
       if (crDirection !== 'NEUTRAL') {
         return {
-          score: 100,
+          score: crDirection === 'SHORT' ? -100 : 100,
           direction: crDirection,
-          status: 'TRENDING',
+          status: 'CLIMAX_REVERSAL',
           reason: crReason,
           indicators: completeIndDetails,
           gates: { ...defaultGates, g1: true, g2: true, g3: true, g4: true, g5: true, g6: true, g7: true, g8: true, g9: true, g10: true, blockReasons: [] },
@@ -702,15 +702,95 @@ export function runScoringEngine(
           regime
         };
       }
+
+      // --- Climax Proximity Score ---
+      // Instead of returning 0, compute how close the market is to a climax reversal.
+      // Each sub-condition contributes to the proximity score so the scanner shows useful data.
+      let climaxProximity = 0;
+      const proximityReasons: string[] = [];
+
+      // Check C1 sub-conditions independently for BOTH directions
+      if (isClimaxC1) { climaxProximity += 15; proximityReasons.push('C1 range climax'); }
+      if (isOverextendedC1) { climaxProximity += 20; proximityReasons.push('C1 overextended'); }
+      if (isVolOkC1) { climaxProximity += 10; proximityReasons.push('C1 vol expansion'); }
+
+      // Check if C2 shows rejection characteristics
+      if (c2.wickRatio >= min_rejection_wick_ratio) { climaxProximity += 15; proximityReasons.push('C2 rejection wick'); }
+      
+      // Check if C2 made new extreme beyond C1
+      const c2MadeNewHigh = c2.high >= c1.high;
+      const c2MadeNewLow = c2.low <= c1.low;
+      if (c2MadeNewHigh || c2MadeNewLow) { climaxProximity += 10; proximityReasons.push('C2 new extreme'); }
+
+      // Check bearish/bullish reversal candle structure
+      const c1Bullish = c1.close > c1.open;
+      const c1Bearish = c1.close < c1.open;
+      const c2Bearish = c2.close < c2.open;
+      const c2Bullish = c2.close > c2.open;
+
+      if ((c1Bullish && c2Bearish) || (c1Bearish && c2Bullish)) {
+        climaxProximity += 15; proximityReasons.push('C1→C2 reversal');
+      }
+
+      // Determine the strongest direction from what we see
+      let proximityDir: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL';
+      if (c1Bullish && c2Bearish && c2MadeNewHigh) {
+        proximityDir = 'SHORT'; // Bearish climax reversal building
+      } else if (c1Bearish && c2Bullish && c2MadeNewLow) {
+        proximityDir = 'LONG'; // Bullish climax reversal building
+      }
+
+      // Check trigger proximity on C3
+      if (proximityDir === 'SHORT') {
+        const triggerLevel = c2.low;
+        const distToTrigger = ((c3.close - triggerLevel) / triggerLevel) * 100;
+        if (distToTrigger < 0.5) { climaxProximity += 15; proximityReasons.push('C3 near trigger'); }
+      } else if (proximityDir === 'LONG') {
+        const triggerLevel = c2.high;
+        const distToTrigger = ((triggerLevel - c3.close) / triggerLevel) * 100;
+        if (distToTrigger < 0.5) { climaxProximity += 15; proximityReasons.push('C3 near trigger'); }
+      }
+
+      // Cap at 95 (100 is reserved for confirmed signals)
+      climaxProximity = Math.min(climaxProximity, 95);
+
+      const climaxGates = { ...defaultGates, blockReasons: [] as string[] };
+      climaxGates.g1 = true;
+      climaxGates.g2 = true;
+      climaxGates.g3 = isClimaxC1;
+      climaxGates.g4 = isOverextendedC1;
+      climaxGates.g5 = isVolOkC1;
+      climaxGates.g6 = c2.wickRatio >= min_rejection_wick_ratio;
+      climaxGates.g7 = (c2MadeNewHigh || c2MadeNewLow);
+      climaxGates.g8 = (c1Bullish && c2Bearish) || (c1Bearish && c2Bullish);
+
+      if (!climaxGates.g3) climaxGates.blockReasons.push('C1 range not climactic');
+      if (!climaxGates.g4) climaxGates.blockReasons.push('C1 not overextended from EMA200');
+      if (!climaxGates.g5) climaxGates.blockReasons.push('ATR below average (low volatility)');
+      if (!climaxGates.g6) climaxGates.blockReasons.push('C2 no rejection wick');
+      if (!climaxGates.g7) climaxGates.blockReasons.push('C2 no new extreme');
+      if (!climaxGates.g8) climaxGates.blockReasons.push('No C1→C2 reversal candle');
+
+      return {
+        score: climaxProximity * (proximityDir === 'SHORT' ? -1 : 1),
+        direction: proximityDir,
+        status: climaxProximity >= 60 ? 'CLIMAX_BUILDING' : regime.label,
+        reason: proximityReasons.length > 0 ? proximityReasons.join(' | ') : 'No climax conditions met',
+        indicators: completeIndDetails,
+        gates: climaxGates,
+        wmPattern: 'NONE',
+        regime
+      };
     }
 
+    // Fallback if not enough candle history
     return {
       score: 0,
       direction: 'NEUTRAL',
       status: regime.label,
-      reason: 'No climax reversal pattern detected',
+      reason: 'Insufficient history for climax detection',
       indicators: completeIndDetails,
-      gates: { ...defaultGates, blockReasons: [] },
+      gates: { ...defaultGates, blockReasons: ['Need 200+ candles for climax analysis'] },
       wmPattern: 'NONE',
       regime
     };
@@ -823,12 +903,6 @@ export function runScoringEngine(
 
   let finalDir = dir;
   let finalReason = entryAllowed ? 'All gates passed' : gates.blockReasons.join(' | ');
-
-  if (params.activeStrategy === 'climax_reversal') {
-     // If we reached here, it means climax reversal didn't match
-     finalDir = 'NEUTRAL';
-     finalReason = 'No climax reversal pattern detected';
-  }
 
   return {
     score: Math.round(confidence * 100) * (finalDir === 'SHORT' ? -1 : 1),
