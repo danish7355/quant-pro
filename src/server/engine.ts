@@ -406,11 +406,16 @@ function processAutoTradingRules(scannedList: CoinDetail[]) {
   const openCount = state.positions.length;
   if (openCount >= state.settings.maxConcurrentTrades) return;
 
+  // BUG FIX: SHORT signals have negative scores (e.g. -87).
+  // Use Math.abs(score) to evaluate signal strength for both LONG and SHORT.
   const validCandidates = scannedList.filter(c => 
-    c.score >= state.settings.autoTradeThreshold && 
+    Math.abs(c.score) >= state.settings.autoTradeThreshold && 
     c.direction !== 'NEUTRAL' &&
     !state.positions.some(p => p.symbol === c.symbol)
   );
+
+  // Sort by absolute score strength (strongest signal first, regardless of direction)
+  validCandidates.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
 
   if (validCandidates.length > 0) {
     const topCandidate = validCandidates[0];
@@ -420,6 +425,10 @@ function processAutoTradingRules(scannedList: CoinDetail[]) {
 
 function openPosition(coin: CoinDetail) {
   const atr = coin.indicators.atr;
+  if (!atr || atr <= 0) {
+    addTerminalLog(`⚠️ Skipped ${coin.symbol}: Invalid ATR (${atr})`);
+    return;
+  }
   const buffer = atr * 0.2; // 0.2 ATR buffer for SL
 
   let sl: number;
@@ -449,9 +458,28 @@ function openPosition(coin: CoinDetail) {
   }
 
   const slDist = Math.abs(coin.price - sl);
+  if (slDist <= 0) {
+    addTerminalLog(`⚠️ Skipped ${coin.symbol}: SL distance is 0`);
+    return;
+  }
+
+  // Validate minimum Risk:Reward ratio
+  const tp1Dist = Math.abs(tp1 - coin.price);
+  const rrRatio = tp1Dist / slDist;
+  if (state.settings.minRRRatio > 0 && rrRatio < state.settings.minRRRatio) {
+    addTerminalLog(`⚠️ Skipped ${coin.symbol}: R:R ${rrRatio.toFixed(2)} < min ${state.settings.minRRRatio}`);
+    return;
+  }
+
   const riskAmount = state.balance * (state.settings.accountRiskPct / 100);
   const qty = riskAmount / slDist;
   const allocatedBalance = (coin.price * qty) / state.settings.leverage;
+
+  // Balance guard: ensure we have enough balance to allocate
+  if (allocatedBalance <= 0 || allocatedBalance > state.balance * 0.95) {
+    addTerminalLog(`⚠️ Skipped ${coin.symbol}: Insufficient balance ($${state.balance.toFixed(2)}) for margin $${allocatedBalance.toFixed(2)}`);
+    return;
+  }
 
   const newPos: Position = {
     id: Math.random().toString(36).substr(2, 9),
@@ -475,9 +503,9 @@ function openPosition(coin: CoinDetail) {
   };
 
   state.positions.push(newPos);
-  scheduleStateSync();
   state.balance -= allocatedBalance;
-  addTerminalLog(`Opened ${coin.direction} on ${coin.symbol} at ${coin.price}`);
+  scheduleStateSync();
+  addTerminalLog(`Opened ${coin.direction} on ${coin.symbol} at ${coin.price} | SL: ${sl.toFixed(4)} | TP1: ${tp1.toFixed(4)} | R:R: ${rrRatio.toFixed(2)} | Margin: $${allocatedBalance.toFixed(2)}`);
   if (state.settings.alertOnTradeExecuted) {
     dispatchTelegramAlert(`🚨 *NEW TRADE EXECUTED*\nSymbol: ${coin.symbol}\nDirection: ${coin.direction}\nEntry: ${coin.price.toFixed(4)}\nSL: ${sl.toFixed(4)}\nTP1: ${tp1.toFixed(4)}`);
   }
