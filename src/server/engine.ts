@@ -248,9 +248,27 @@ async function fetchTopFuturesPairs() {
     }
   }
 
-  // Fallback to MEXC API which is identical to Binance API but without strict IP bans
+  // Fallback to Bybit Linear Tickers if Binance fails
   if (!Array.isArray(data)) {
-    console.warn('Binance endpoints failed or returned non-array, falling back to MEXC...', data);
+    try {
+      const response = await fetch('https://api.bybit.com/v5/market/tickers?category=linear');
+      const bybitData = await response.json();
+      if (Array.isArray(bybitData?.result?.list)) {
+        data = bybitData.result.list.map((c: any) => ({
+          symbol: c.symbol,
+          lastPrice: c.lastPrice,
+          priceChangePercent: (parseFloat(c.price24hPcnt || '0') * 100).toString(),
+          quoteVolume: c.turnover24h || c.volume24h
+        }));
+      }
+    } catch (e) {
+      console.warn('Failed to fetch from Bybit fallback');
+    }
+  }
+
+  // Fallback to MEXC API
+  if (!Array.isArray(data)) {
+    console.warn('Binance & Bybit endpoints failed, falling back to MEXC...', data);
     try {
       const response = await fetch('https://api.mexc.com/api/v3/ticker/24hr');
       data = await response.json();
@@ -261,7 +279,7 @@ async function fetchTopFuturesPairs() {
   }
 
   if (!Array.isArray(data)) {
-    console.warn('All API endpoints (Binance & MEXC) failed or returned non-array');
+    console.warn('All API endpoints (Binance, Bybit & MEXC) failed or returned non-array');
     return [];
   }
 
@@ -583,156 +601,280 @@ export function closePosition(pos: Position, reason: TradeLog['exitReason']) {
   }
 }
 
-// Websocket and Live Pricing
+// Multi-Exchange Fallback Feed Engine
 let ws: WebSocket | null = null;
 let nseInterval: any = null;
 let reconnectTimeout: any = null;
+let watchdogInterval: any = null;
+let fallbackRestInterval: any = null;
+let lastTickTimestamp: number = Date.now();
+let currentWsIndex = 0;
+
+const WS_FEED_ENDPOINTS = [
+  { name: 'Binance Futures WS', url: 'wss://fstream.binance.com/ws/!miniTicker@arr' },
+  { name: 'Binance Spot Vision WS', url: 'wss://data-stream.binance.vision/ws/!miniTicker@arr' },
+  { name: 'Binance Spot Public WS', url: 'wss://stream.binance.com/ws/!miniTicker@arr' }
+];
+
+export async function fetchFallbackTickers(): Promise<{ symbol: string; price: number }[]> {
+  // 1. Try Binance Futures REST
+  try {
+    const res = await fetch("https://fapi.binance.com/fapi/v1/ticker/price", { signal: AbortSignal.timeout(3000) });
+    const data = await res.json();
+    if (Array.isArray(data) && data.length > 0) {
+      return data.map((d: any) => ({ symbol: d.symbol, price: parseFloat(d.price) }));
+    }
+  } catch (e) {}
+
+  // 2. Try Binance Spot REST
+  try {
+    const res = await fetch("https://data-api.binance.vision/api/v3/ticker/price", { signal: AbortSignal.timeout(3000) });
+    const data = await res.json();
+    if (Array.isArray(data) && data.length > 0) {
+      return data.map((d: any) => ({ symbol: d.symbol, price: parseFloat(d.price) }));
+    }
+  } catch (e) {}
+
+  // 3. Try Bybit Linear REST
+  try {
+    const res = await fetch("https://api.bybit.com/v5/market/tickers?category=linear", { signal: AbortSignal.timeout(3000) });
+    const data = await res.json();
+    const list = data?.result?.list;
+    if (Array.isArray(list) && list.length > 0) {
+      return list.map((d: any) => ({ symbol: d.symbol, price: parseFloat(d.lastPrice) }));
+    }
+  } catch (e) {}
+
+  // 4. Try MEXC REST
+  try {
+    const res = await fetch("https://api.mexc.com/api/v3/ticker/price", { signal: AbortSignal.timeout(3000) });
+    const data = await res.json();
+    if (Array.isArray(data) && data.length > 0) {
+      return data.map((d: any) => ({ symbol: d.symbol, price: parseFloat(d.price) }));
+    }
+  } catch (e) {}
+
+  // 5. Try Gate.io REST
+  try {
+    const res = await fetch("https://api.gateio.ws/api/v4/spot/tickers", { signal: AbortSignal.timeout(3000) });
+    const data = await res.json();
+    if (Array.isArray(data) && data.length > 0) {
+      return data.map((d: any) => ({ symbol: (d.currency_pair || '').replace('_', ''), price: parseFloat(d.last) }));
+    }
+  } catch (e) {}
+
+  return [];
+}
+
+export function handlePriceUpdate(tickers: { symbol: string; price: number }[]) {
+  if (!Array.isArray(tickers) || tickers.length === 0) return;
+  lastTickTimestamp = Date.now();
+
+  const currentPositions = [...state.positions];
+  let positionModified = false;
+
+  currentPositions.forEach(p => {
+    const ticker = tickers.find(t => t.symbol === p.symbol);
+    if (!ticker || isNaN(ticker.price) || ticker.price <= 0) return;
+
+    const currentPrice = ticker.price;
+    const isLong = p.direction === 'LONG';
+    let closedReason: TradeLog['exitReason'] | null = null;
+    const pnl = isLong ? (currentPrice - p.entryPrice) * p.quantity : (p.entryPrice - currentPrice) * p.quantity;
+
+    if (state.settings.activeStrategy === 'v3' || state.settings.activeStrategy === 'climax_reversal') {
+      const timeOpen = new Date(p.timeOpen).getTime();
+      const elapsedHours = (Date.now() - timeOpen) / (1000 * 60 * 60);
+      const result = manageOpenPositionV3(
+        p,
+        { open: currentPrice, high: currentPrice, low: currentPrice, close: currentPrice },
+        p.entryAtr,
+        elapsedHours,
+        state.settings.timeBasedExitCandles
+      );
+
+      if (result.action === 'EXIT') {
+        closePosition({ ...p, currentPrice, unrealizedPnl: pnl }, result.reason as any);
+        positionModified = true;
+      } else if (result.action.startsWith('PARTIAL') && result.partialRatio) {
+        closePartialPosition({ ...p, currentPrice, unrealizedPnl: pnl }, result.reason as any, result.partialRatio);
+        positionModified = true;
+
+        const idx = state.positions.findIndex(pos => pos.id === p.id);
+        if (idx !== -1) {
+          const shrinkRatio = result.updatedPosition.sizeRemainingPct / state.positions[idx].sizeRemainingPct;
+          state.positions[idx].quantity *= shrinkRatio;
+          state.positions[idx].allocatedBalance *= shrinkRatio;
+          state.positions[idx].sizeRemainingPct = result.updatedPosition.sizeRemainingPct;
+        }
+      }
+
+      const idx = state.positions.findIndex(pos => pos.id === p.id);
+      if (idx !== -1 && result.action !== 'EXIT') {
+        state.positions[idx].currentPrice = currentPrice;
+        state.positions[idx].unrealizedPnl = isLong ? (currentPrice - state.positions[idx].entryPrice) * state.positions[idx].quantity : (state.positions[idx].entryPrice - currentPrice) * state.positions[idx].quantity;
+        state.positions[idx].maxProfitablePrice = result.updatedPosition.maxProfitablePrice;
+        state.positions[idx].trailingStop = result.updatedPosition.trailingStop;
+        state.positions[idx].trailingStopActive = result.updatedPosition.trailingStopActive;
+      }
+      return;
+    }
+
+    // Original V2 SMC logic with Trailing Stop
+    let newMaxProfitable = p.maxProfitablePrice || p.entryPrice;
+    if (isLong) {
+      if (currentPrice > newMaxProfitable) newMaxProfitable = currentPrice;
+    } else {
+      if (currentPrice < newMaxProfitable) newMaxProfitable = currentPrice;
+    }
+
+    let newTrailingStop = p.trailingStop || p.sl;
+    let trailingStopActive = p.trailingStopActive || false;
+
+    const hitTp1ForTrail = isLong ? (newMaxProfitable >= p.tp1) : (newMaxProfitable <= p.tp1);
+    const hitTp2ForTrail = isLong ? (newMaxProfitable >= p.tp2) : (newMaxProfitable <= p.tp2);
+
+    if (hitTp2ForTrail) {
+      newTrailingStop = p.tp1;
+      trailingStopActive = true;
+    } else if (hitTp1ForTrail) {
+      newTrailingStop = p.entryPrice;
+      trailingStopActive = true;
+    }
+
+    const currentStop = newTrailingStop;
+
+    if (isLong) {
+      if (currentPrice <= currentStop) closedReason = trailingStopActive ? 'TS' as any : 'SL';
+      else if (currentPrice >= p.tp3) closedReason = 'TP3';
+    } else {
+      if (currentPrice >= currentStop) closedReason = trailingStopActive ? 'TS' as any : 'SL';
+      else if (currentPrice <= p.tp3) closedReason = 'TP3';
+    }
+
+    if (closedReason) {
+      closePosition({ ...p, currentPrice, unrealizedPnl: pnl }, closedReason);
+      positionModified = true;
+    } else {
+      const idx = state.positions.findIndex(pos => pos.id === p.id);
+      if (idx !== -1) {
+        state.positions[idx].currentPrice = currentPrice;
+        state.positions[idx].unrealizedPnl = pnl;
+        state.positions[idx].maxProfitablePrice = newMaxProfitable;
+        state.positions[idx].trailingStop = newTrailingStop;
+        state.positions[idx].trailingStopActive = trailingStopActive;
+      }
+    }
+  });
+
+  // Update coins list prices in real time
+  state.coins.forEach(c => {
+    const ticker = tickers.find(t => t.symbol === c.symbol);
+    if (ticker && !isNaN(ticker.price) && ticker.price > 0) {
+      c.price = ticker.price;
+    }
+  });
+
+  if (positionModified) {
+    bumpStateVersion();
+  }
+}
 
 function connectWS() {
   if (state.settings.market === 'NSE') {
-    // NSE polling mock logic
     nseInterval = setInterval(() => {
-       const data = state.positions.map(p => ({
-         s: p.symbol,
-         c: (p.currentPrice * (1 + (Math.random() * 0.002 - 0.001))).toString()
-       }));
-       handleWsData(data);
+      const data = state.positions.map(p => ({
+        symbol: p.symbol,
+        price: p.currentPrice * (1 + (Math.random() * 0.002 - 0.001))
+      }));
+      handlePriceUpdate(data);
     }, 3000);
     return;
   }
 
-  ws = new WebSocket('wss://data-stream.binance.vision/ws/!miniTicker@arr');
-  
-  ws.on('message', (message) => {
-    try {
-      const data = JSON.parse(message.toString());
-      handleWsData(data);
-    } catch (e) {}
-  });
+  const activeSource = WS_FEED_ENDPOINTS[currentWsIndex];
 
-  ws.on('error', (err) => {
-    console.warn("Binance WS error:", err.message);
-    if (ws) ws.close();
-  });
+  try {
+    if (ws) {
+      ws.removeAllListeners();
+      try { ws.close(); } catch(e) {}
+      ws = null;
+    }
 
-  ws.on('close', () => {
-    console.log("Binance WS closed, reconnecting in 3s...");
-    reconnectTimeout = setTimeout(connectWS, 3000);
-  });
-}
+    ws = new WebSocket(activeSource.url);
 
-function handleWsData(data: any[]) {
-  if (!Array.isArray(data)) return;
+    ws.on('open', () => {
+      lastTickTimestamp = Date.now();
+    });
 
-  // Process closures synchronously
-  // We need to iterate over a copy of positions because closePosition modifies the array
-  const currentPositions = [...state.positions];
-  
-  currentPositions.forEach(p => {
-     const ticker = data.find((t: any) => t.s === p.symbol);
-     if (!ticker) return;
-     
-     const currentPrice = parseFloat(ticker.c);
-     const isLong = p.direction === 'LONG';
-     let closedReason: TradeLog['exitReason'] | null = null;
-     const pnl = isLong ? (currentPrice - p.entryPrice) * p.quantity : (p.entryPrice - currentPrice) * p.quantity;
-     
-     if (state.settings.activeStrategy === 'v3' || state.settings.activeStrategy === 'climax_reversal') {
-       const timeOpen = new Date(p.timeOpen).getTime();
-       const elapsedHours = (Date.now() - timeOpen) / (1000 * 60 * 60);
-       const result = manageOpenPositionV3(
-         p, 
-         { open: currentPrice, high: currentPrice, low: currentPrice, close: currentPrice },
-         p.entryAtr,
-         elapsedHours,
-         state.settings.timeBasedExitCandles
-       );
-       
-       if (result.action === 'EXIT') {
-         closePosition({ ...p, currentPrice, unrealizedPnl: pnl }, result.reason as any);
-       } else if (result.action.startsWith('PARTIAL') && result.partialRatio) {
-         closePartialPosition({ ...p, currentPrice, unrealizedPnl: pnl }, result.reason as any, result.partialRatio);
-         
-         // Update the actual position remaining size
-         const idx = state.positions.findIndex(pos => pos.id === p.id);
-         if (idx !== -1) {
-            const shrinkRatio = result.updatedPosition.sizeRemainingPct / state.positions[idx].sizeRemainingPct;
-            state.positions[idx].quantity *= shrinkRatio;
-            state.positions[idx].allocatedBalance *= shrinkRatio;
-            state.positions[idx].sizeRemainingPct = result.updatedPosition.sizeRemainingPct;
-         }
-       }
-       
-       // Update position properties
-       const idx = state.positions.findIndex(pos => pos.id === p.id);
-       if (idx !== -1 && result.action !== 'EXIT') {
-          state.positions[idx].currentPrice = currentPrice;
-          state.positions[idx].unrealizedPnl = isLong ? (currentPrice - state.positions[idx].entryPrice) * state.positions[idx].quantity : (state.positions[idx].entryPrice - currentPrice) * state.positions[idx].quantity;
-          state.positions[idx].maxProfitablePrice = result.updatedPosition.maxProfitablePrice;
-          state.positions[idx].trailingStop = result.updatedPosition.trailingStop;
-          state.positions[idx].trailingStopActive = result.updatedPosition.trailingStopActive;
-       }
-       return;
-     }
-
-     
-     // Original v2 (SMC) logic - Updated with Trailing Stop
-     // Step 1 - Update peak favorable excursion
-     let newMaxProfitable = p.maxProfitablePrice || p.entryPrice;
-     if (isLong) {
-        if (currentPrice > newMaxProfitable) newMaxProfitable = currentPrice;
-     } else {
-        if (currentPrice < newMaxProfitable) newMaxProfitable = currentPrice;
-     }
-
-     // Step 2 - Stepwise Trailing Stop
-     let newTrailingStop = p.trailingStop || p.sl;
-     let trailingStopActive = p.trailingStopActive || false;
-     
-     const hitTp1ForTrail = isLong ? (newMaxProfitable >= p.tp1) : (newMaxProfitable <= p.tp1);
-     const hitTp2ForTrail = isLong ? (newMaxProfitable >= p.tp2) : (newMaxProfitable <= p.tp2);
-
-     if (hitTp2ForTrail) {
-        newTrailingStop = p.tp1;
-        trailingStopActive = true;
-     } else if (hitTp1ForTrail) {
-        newTrailingStop = p.entryPrice;
-        trailingStopActive = true;
-     }
-
-     const currentStop = newTrailingStop;
-     
-     if (isLong) {
-        if (currentPrice <= currentStop) closedReason = trailingStopActive ? 'TS' as any : 'SL';
-        else if (currentPrice >= p.tp3) closedReason = 'TP3';
-     } else {
-        if (currentPrice >= currentStop) closedReason = trailingStopActive ? 'TS' as any : 'SL';
-        else if (currentPrice <= p.tp3) closedReason = 'TP3';
-     }
-
-     if (closedReason) {
-        closePosition({ ...p, currentPrice, unrealizedPnl: pnl }, closedReason);
-     } else {
-        const idx = state.positions.findIndex(pos => pos.id === p.id);
-        if (idx !== -1) {
-           state.positions[idx].currentPrice = currentPrice;
-           state.positions[idx].unrealizedPnl = pnl;
-           state.positions[idx].maxProfitablePrice = newMaxProfitable;
-           state.positions[idx].trailingStop = newTrailingStop;
-           state.positions[idx].trailingStopActive = trailingStopActive;
+    ws.on('message', (message) => {
+      try {
+        const raw = JSON.parse(message.toString());
+        if (Array.isArray(raw)) {
+          const tickers = raw.map((d: any) => ({
+            symbol: d.s,
+            price: parseFloat(d.c)
+          }));
+          handlePriceUpdate(tickers);
         }
-     }
-  });
+      } catch (e) {}
+    });
 
-  // Update coins list prices
-  state.coins.forEach(c => {
-     const ticker = data.find((t: any) => t.s === c.symbol);
-     if (ticker) {
-        c.price = parseFloat(ticker.c);
-     }
-  });
+    ws.on('error', () => {
+      rotateFeed();
+    });
+
+    ws.on('close', () => {
+      rotateFeed();
+    });
+  } catch (e) {
+    rotateFeed();
+  }
 }
 
+function rotateFeed() {
+  if (reconnectTimeout) clearTimeout(reconnectTimeout);
+  currentWsIndex = (currentWsIndex + 1) % WS_FEED_ENDPOINTS.length;
+  reconnectTimeout = setTimeout(connectWS, 2000);
+}
+
+function startWatchdogAndFallback() {
+  if (watchdogInterval) clearInterval(watchdogInterval);
+  if (fallbackRestInterval) clearInterval(fallbackRestInterval);
+
+  // Watchdog checks every 2.5 seconds if price stream is stale (> 4s without ticks)
+  watchdogInterval = setInterval(async () => {
+    const timeSinceLastTick = Date.now() - lastTickTimestamp;
+    if (timeSinceLastTick > 4000) {
+      const fallbackTickers = await fetchFallbackTickers();
+      if (fallbackTickers.length > 0) {
+        handlePriceUpdate(fallbackTickers);
+      }
+      
+      // If stale for more than 8 seconds, rotate WebSocket to next exchange
+      if (timeSinceLastTick > 8000) {
+        rotateFeed();
+      }
+    }
+  }, 2500);
+
+  // Continuous fallback REST poller: guarantees positions and prices update 24/7
+  fallbackRestInterval = setInterval(async () => {
+    if (state.positions.length > 0 && (Date.now() - lastTickTimestamp > 2000)) {
+      const tickers = await fetchFallbackTickers();
+      if (tickers.length > 0) {
+        handlePriceUpdate(tickers);
+      }
+    }
+  }, 3000);
+}
+
+function stopWatchdogAndFallback() {
+  if (watchdogInterval) clearInterval(watchdogInterval);
+  if (fallbackRestInterval) clearInterval(fallbackRestInterval);
+  watchdogInterval = null;
+  fallbackRestInterval = null;
+}
 
 let engineInterval: any = null;
 export function startEngine() {
@@ -741,6 +883,7 @@ export function startEngine() {
   engineInterval = setInterval(scanMarkets, state.settings.scanInterval * 1000);
   addTerminalLog("Engine started");
   if (!ws && !nseInterval) connectWS();
+  startWatchdogAndFallback();
 }
 
 export function stopEngine() {
@@ -755,4 +898,6 @@ export function stopEngine() {
     clearInterval(nseInterval);
     nseInterval = null;
   }
+  stopWatchdogAndFallback();
 }
+

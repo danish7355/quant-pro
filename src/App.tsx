@@ -195,68 +195,155 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
+  const [activeFeedName, setActiveFeedName] = useState('Binance Futures');
+
   useEffect(() => {
     let ws: WebSocket | null = null;
     let reconnectTimer: any = null;
+    let watchdogTimer: any = null;
+    let lastTickTime = Date.now();
+    let wsIndex = 0;
+
+    const CLIENT_WS_POOLS = [
+      { name: 'Binance Futures', url: 'wss://fstream.binance.com/ws/!miniTicker@arr' },
+      { name: 'Binance Vision', url: 'wss://data-stream.binance.vision/ws/!miniTicker@arr' },
+      { name: 'Binance Spot', url: 'wss://stream.binance.com/ws/!miniTicker@arr' }
+    ];
+
+    const applyTickers = (rawTickers: any[]) => {
+      if (!Array.isArray(rawTickers) || rawTickers.length === 0) return;
+      lastTickTime = Date.now();
+
+      // Normalize tickers across exchanges
+      const normalized: { symbol: string; price: number }[] = rawTickers.map(item => {
+        const symbol = (item.s || item.symbol || item.currency_pair || '').replace('_', '').replace('-', '');
+        const price = parseFloat(item.c || item.price || item.lastPrice || item.last || '0');
+        return { symbol, price };
+      }).filter(t => t.symbol && !isNaN(t.price) && t.price > 0);
+
+      // Update coins list prices in real time
+      setCoins(prevCoins => {
+        let changed = false;
+        const updated = prevCoins.map(coin => {
+          const t = normalized.find(item => item.symbol === coin.symbol);
+          if (t && t.price !== coin.price) {
+            changed = true;
+            return { ...coin, price: t.price };
+          }
+          return coin;
+        });
+        return changed ? updated : prevCoins;
+      });
+
+      // Update open position prices & unrealized PnL in real time
+      setPositions(prevPositions => {
+        let changed = false;
+        const updated = prevPositions.map(pos => {
+          const t = normalized.find(item => item.symbol === pos.symbol);
+          if (t && t.price !== pos.currentPrice) {
+            changed = true;
+            const newPrice = t.price;
+            const isLong = pos.direction === 'LONG';
+            const pnl = isLong ? (newPrice - pos.entryPrice) * pos.quantity : (pos.entryPrice - newPrice) * pos.quantity;
+            return { ...pos, currentPrice: newPrice, unrealizedPnl: pnl };
+          }
+          return pos;
+        });
+        return changed ? updated : prevPositions;
+      });
+    };
+
+    const fetchFallbackREST = async () => {
+      // 1. Try Binance Futures REST
+      try {
+        const res = await fetch("https://fapi.binance.com/fapi/v1/ticker/price", { signal: AbortSignal.timeout(2500) });
+        const data = await res.json();
+        if (Array.isArray(data) && data.length > 0) {
+          applyTickers(data);
+          setActiveFeedName('Binance REST');
+          return;
+        }
+      } catch (e) {}
+
+      // 2. Try Bybit Linear REST
+      try {
+        const res = await fetch("https://api.bybit.com/v5/market/tickers?category=linear", { signal: AbortSignal.timeout(2500) });
+        const data = await res.json();
+        const list = data?.result?.list;
+        if (Array.isArray(list) && list.length > 0) {
+          applyTickers(list);
+          setActiveFeedName('Bybit REST');
+          return;
+        }
+      } catch (e) {}
+
+      // 3. Try MEXC REST
+      try {
+        const res = await fetch("https://api.mexc.com/api/v3/ticker/price", { signal: AbortSignal.timeout(2500) });
+        const data = await res.json();
+        if (Array.isArray(data) && data.length > 0) {
+          applyTickers(data);
+          setActiveFeedName('MEXC REST');
+          return;
+        }
+      } catch (e) {}
+    };
 
     const connectDirectWS = () => {
+      const activePool = CLIENT_WS_POOLS[wsIndex];
       try {
-        ws = new WebSocket('wss://stream.binance.com/ws/!miniTicker@arr');
+        if (ws) {
+          try { ws.close(); } catch(e) {}
+          ws = null;
+        }
+
+        ws = new WebSocket(activePool.url);
+        ws.onopen = () => {
+          lastTickTime = Date.now();
+          setActiveFeedName(activePool.name);
+        };
+
         ws.onmessage = (event) => {
           try {
-            const tickers = JSON.parse(event.data);
-            if (Array.isArray(tickers)) {
-              // Update coins list prices in real time
-              setCoins(prevCoins => {
-                let changed = false;
-                const updated = prevCoins.map(coin => {
-                  const t = tickers.find((item: any) => item.s === coin.symbol);
-                  if (t) {
-                    const newPrice = parseFloat(t.c);
-                    if (newPrice !== coin.price) {
-                      changed = true;
-                      return { ...coin, price: newPrice };
-                    }
-                  }
-                  return coin;
-                });
-                return changed ? updated : prevCoins;
-              });
-
-              // Update open position prices & unrealized PnL in real time
-              setPositions(prevPositions => {
-                let changed = false;
-                const updated = prevPositions.map(pos => {
-                  const t = tickers.find((item: any) => item.s === pos.symbol);
-                  if (t) {
-                    const newPrice = parseFloat(t.c);
-                    if (newPrice !== pos.currentPrice) {
-                      changed = true;
-                      const isLong = pos.direction === 'LONG';
-                      const pnl = isLong ? (newPrice - pos.entryPrice) * pos.quantity : (pos.entryPrice - newPrice) * pos.quantity;
-                      return { ...pos, currentPrice: newPrice, unrealizedPnl: pnl };
-                    }
-                  }
-                  return pos;
-                });
-                return changed ? updated : prevPositions;
-              });
-            }
+            const data = JSON.parse(event.data);
+            applyTickers(data);
           } catch (e) {}
         };
 
         ws.onclose = () => {
-          reconnectTimer = setTimeout(connectDirectWS, 5000);
+          rotateClientFeed();
         };
+
         ws.onerror = () => {
-          if (ws) ws.close();
+          rotateClientFeed();
         };
-      } catch (e) {}
+      } catch (e) {
+        rotateClientFeed();
+      }
+    };
+
+    const rotateClientFeed = () => {
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      wsIndex = (wsIndex + 1) % CLIENT_WS_POOLS.length;
+      reconnectTimer = setTimeout(connectDirectWS, 2000);
     };
 
     connectDirectWS();
+
+    // Client-side Watchdog: checks every 3 seconds if price stream is stale (> 4s without ticks)
+    watchdogTimer = setInterval(async () => {
+      const timeSinceLast = Date.now() - lastTickTime;
+      if (timeSinceLast > 4000) {
+        await fetchFallbackREST();
+        if (timeSinceLast > 8000) {
+          rotateClientFeed();
+        }
+      }
+    }, 3000);
+
     return () => {
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (watchdogTimer) clearInterval(watchdogTimer);
       if (ws) ws.close();
     };
   }, []);
@@ -430,8 +517,8 @@ export default function App() {
             </span>
           </div>
           <div className="flex items-center justify-between text-[11px] font-mono text-gray-400 px-2">
-            <span>Latency</span>
-            <span className="text-emerald-400">0ms LOCAL</span>
+            <span>Feed Source</span>
+            <span className="text-emerald-400 font-semibold">{activeFeedName}</span>
           </div>
         </div>
       </div>
@@ -444,6 +531,10 @@ export default function App() {
              <h2 className="text-sm font-bold uppercase tracking-wider text-gray-200">
                {TABS.find(t => t.id === activeTab)?.label}
              </h2>
+             <span className="hidden sm:inline-flex items-center px-2.5 py-0.5 rounded text-[10px] font-mono font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse mr-1.5"></span>
+               LIVE: {activeFeedName}
+             </span>
           </div>
           <div className="flex items-center gap-4 text-sm font-mono">
             <div className="hidden sm:flex items-center gap-4 mr-4 text-gray-400">
