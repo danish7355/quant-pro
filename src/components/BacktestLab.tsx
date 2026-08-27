@@ -48,7 +48,20 @@ export default function BacktestLab({ settings, coins, selectedSymbol, onSelectS
           </p>
         </div>
 
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center gap-3">
+          <select
+            value={settings.activeStrategy || 'v2'}
+            onChange={(e) => {
+              settings.activeStrategy = e.target.value;
+            }}
+            className="bg-[#0E1117] border border-[#30363D] text-xs rounded px-3 py-1.5 focus:outline-none focus:border-emerald-500 font-bold text-emerald-400"
+          >
+            <option value="v2">V2 (SMC)</option>
+            <option value="v3">V3 (EMA/BB)</option>
+            <option value="climax_reversal">Climax Reversal</option>
+            <option value="volatility_compression_breakout">Volatility Compression Breakout</option>
+          </select>
+
           <select
             value={selectedSymbol}
             onChange={(e) => onSelectSymbol(e.target.value)}

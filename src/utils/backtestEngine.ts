@@ -5,7 +5,7 @@
 
 import { runScoringEngine } from './indicators';
 import { calculatePositionSize } from './riskManager';
-import { manageOpenPositionV3 } from './tradeManager';
+import { manageOpenPositionV3, manageCompressionBreakoutPosition } from './tradeManager';
 import { TradeLog, AppSettings } from '../types';
 
 export interface BacktestResult {
@@ -94,7 +94,63 @@ export function runBacktest(
       let partialRatio = 0;
       let pnlForPartial = 0;
 
-      if (settings.activeStrategy === 'v3' || settings.activeStrategy === 'climax_reversal') {
+      if (settings.activeStrategy === 'volatility_compression_breakout' || settings.activeStrategy === 'compression_breakout') {
+        const mockPos: any = {
+          ...openPos,
+          currentPrice: currentBar.close,
+          trailingStop: openPos.trailingStop || openPos.sl,
+        };
+        const result = manageCompressionBreakoutPosition(
+          mockPos,
+          currentBar,
+          openPos.entryAtr,
+          i - openPos.entryBar
+        );
+
+        if (result.action === 'EXIT') {
+          closed = true;
+          exitPrice = result.exitPrice || currentBar.close;
+          exitReason = result.reason;
+        } else if (result.action.startsWith('PARTIAL') && result.partialRatio) {
+          partialClose = true;
+          exitPrice = result.exitPrice || currentBar.close;
+          exitReason = result.reason;
+          partialRatio = result.partialRatio;
+          
+          const rawPnl = openPos.direction === 'LONG'
+            ? (exitPrice - openPos.entryPrice) * openPos.quantity * partialRatio
+            : (openPos.entryPrice - exitPrice) * openPos.quantity * partialRatio;
+            
+          const exitFee = openPos.quantity * partialRatio * exitPrice * feePct;
+          const entryFee = openPos.quantity * partialRatio * openPos.entryPrice * feePct;
+          pnlForPartial = rawPnl - exitFee - entryFee;
+          
+          openPos.sizeRemainingPct = result.updatedPosition.sizeRemainingPct!;
+          openPos.quantity = openPos.quantity * (1 - partialRatio);
+          openPos.margin = openPos.margin * (1 - partialRatio);
+          balance += (openPos.margin * (partialRatio / (1 - partialRatio))) + pnlForPartial;
+          
+          tradeLogs.push({
+            id: Math.random().toString(36).substr(2, 9),
+            symbol,
+            direction: openPos.direction,
+            entryPrice: openPos.entryPrice,
+            closePrice: exitPrice,
+            leverage: settings.leverage,
+            profit: pnlForPartial,
+            pctReturn: (pnlForPartial / (openPos.margin * (partialRatio / (1 - partialRatio)))) * 100,
+            exitReason: exitReason,
+            timeOpen: openPos.timeOpen,
+            timeClose: timeStr,
+            scoreAtEntry: 0,
+            scoreAtClose: 0
+          });
+        }
+        
+        openPos.trailingStop = result.updatedPosition.trailingStop;
+        openPos.trailingStopActive = result.updatedPosition.trailingStopActive;
+        openPos.maxProfitablePrice = result.updatedPosition.maxProfitablePrice;
+      } else if (settings.activeStrategy === 'v3' || settings.activeStrategy === 'climax_reversal') {
         const elapsedHours = i - openPos.entryBar; // assuming 1 bar = 1 hour, simplified for backtest
         // We need to cast openPos as Position but it's a minimal object. 
         // Let's create a temporary object that looks like Position.
@@ -250,18 +306,34 @@ export function runBacktest(
         slAtrMultiple: settings.slAtrMultiple,
       });
 
-      if (scoring.reason === 'All gates passed' && scoring.score >= settings.autoTradeThreshold) {
+      const passesGate = scoring.reason.includes('All gates passed') && Math.abs(scoring.score) >= settings.autoTradeThreshold;
+      if (passesGate) {
         const atr = scoring.indicators.atr || currentBar.close * 0.02;
-        const slDist = atr * settings.slAtrMultiple;
         const isLong = scoring.direction === 'LONG';
         const entryPrice = isLong ? currentBar.close * (1 + slippagePct) : currentBar.close * (1 - slippagePct);
-        const sl = isLong ? entryPrice - slDist : entryPrice + slDist;
-        const tp1 = isLong ? entryPrice + atr * settings.tp1AtrMultiple : entryPrice - atr * settings.tp1AtrMultiple;
 
-        const tp2 = isLong ? entryPrice + atr * settings.tp2AtrMultiple : entryPrice - atr * settings.tp2AtrMultiple;
-        const tp3 = isLong 
-          ? tp2 + atr * settings.tp2AtrMultiple * settings.tp3FibLevel
-          : tp2 - atr * settings.tp2AtrMultiple * settings.tp3FibLevel;
+        let sl: number;
+        let tp1: number;
+        let tp2: number;
+        let tp3: number;
+
+        if (settings.activeStrategy === 'volatility_compression_breakout' || settings.activeStrategy === 'compression_breakout') {
+          const comp = scoring.indicators.compressionState;
+          const windowLow = comp?.windowLow ?? (currentBar.close - atr * 1.5);
+          const windowHigh = comp?.windowHigh ?? (currentBar.close + atr * 1.5);
+          sl = isLong ? windowLow - 0.3 * atr : windowHigh + 0.3 * atr;
+          tp1 = isLong ? entryPrice + 1.5 * atr : entryPrice - 1.5 * atr;
+          tp2 = isLong ? entryPrice + 3.0 * atr : entryPrice - 3.0 * atr;
+          tp3 = isLong ? entryPrice + 5.0 * atr : entryPrice - 5.0 * atr;
+        } else {
+          const slDist = atr * settings.slAtrMultiple;
+          sl = isLong ? entryPrice - slDist : entryPrice + slDist;
+          tp1 = isLong ? entryPrice + atr * settings.tp1AtrMultiple : entryPrice - atr * settings.tp1AtrMultiple;
+          tp2 = isLong ? entryPrice + atr * settings.tp2AtrMultiple : entryPrice - atr * settings.tp2AtrMultiple;
+          tp3 = isLong 
+            ? tp2 + atr * settings.tp2AtrMultiple * settings.tp3FibLevel
+            : tp2 - atr * settings.tp2AtrMultiple * settings.tp3FibLevel;
+        }
 
         const sizeRes = calculatePositionSize(
           balance,

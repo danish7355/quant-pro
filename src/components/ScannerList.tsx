@@ -152,6 +152,20 @@ export default function ScannerList({
         </span>
       );
     }
+    if (status === 'COMPRESSION_COIL') {
+      return (
+        <span className="px-2 py-0.5 rounded bg-yellow-500/15 text-yellow-400 text-[10px] uppercase font-bold tracking-wider border border-yellow-500/25">
+          🌀 COILING
+        </span>
+      );
+    }
+    if (status === 'BREAKOUT_EXPANSION') {
+      return (
+        <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 text-[10px] uppercase font-bold tracking-wider border border-emerald-500/30 animate-pulse">
+          🚀 BREAKOUT
+        </span>
+      );
+    }
     return (
       <span className="px-2 py-0.5 rounded bg-gray-800 text-gray-400 text-[10px] uppercase font-bold tracking-wider">
         {status.replace('_', ' ')}

@@ -7,7 +7,7 @@ export type Timeframe = '1m' | '5m' | '15m' | '30m' | '1H' | '2H' | '4H' | '1D';
 
 export type SignalDirection = 'LONG' | 'SHORT' | 'NEUTRAL';
 
-export type CoinStatus = 'STRONG_TREND' | 'WEAK_TREND' | 'TRANSITION' | 'RANGE' | 'UNSAFE' | 'TRENDING' | 'RANGING' | 'CHOPPY' | 'CLIMAX_REVERSAL' | 'CLIMAX_BUILDING';
+export type CoinStatus = 'STRONG_TREND' | 'WEAK_TREND' | 'TRANSITION' | 'RANGE' | 'UNSAFE' | 'TRENDING' | 'RANGING' | 'CHOPPY' | 'CLIMAX_REVERSAL' | 'CLIMAX_BUILDING' | 'COMPRESSION_COIL' | 'BREAKOUT_EXPANSION';
 
 export interface IndicatorDetails {
   emaFast: number;
@@ -31,6 +31,13 @@ export interface IndicatorDetails {
   supportResistance: {
     supports: number[];
     resistances: number[];
+  };
+  compressionState?: {
+    isCompressed: boolean;
+    windowHigh: number;
+    windowLow: number;
+    windowAvgRange: number;
+    windowAvgVolume: number;
   };
 }
 
@@ -94,7 +101,11 @@ export interface Position {
   maxProfitablePrice?: number;
   unrealizedPnl: number;
   realizedPnl: number;
-  sizeRemainingPct: number; // 100 on start, drops to 60 then 20 after TPs
+  sizeRemainingPct: number; // 100 on start, drops to 75 then trails
+  initialTpHit?: boolean;
+  windowHigh?: number;
+  windowLow?: number;
+  barsOpen?: number;
 }
 
 export interface TradeLog {
@@ -106,7 +117,7 @@ export interface TradeLog {
   leverage: number;
   profit: number;
   pctReturn: number;
-  exitReason: 'TP1' | 'TP2' | 'TP3' | 'SL' | 'TS' | 'MANUAL' | 'TIME_EXIT' | 'DECAY';
+  exitReason: 'TP1' | 'TP2' | 'TP3' | 'SL' | 'TS' | 'MANUAL' | 'TIME_EXIT' | 'DECAY' | 'INVALIDATION' | 'STALL_EXIT' | 'CHANDELIER_TS';
   timeOpen: string;
   timeClose: string;
   scoreAtEntry: number;

@@ -51,18 +51,23 @@ export default function StrategyLab({ settings, onUpdateSettings }: StrategyLabP
           <h2 className="text-sm font-bold text-gray-200">Active Trading Engine</h2>
           <p className="text-xs text-gray-500 mt-1">Select which algorithmic strategy module governs automated entry generation.</p>
         </div>
-        <div className="flex bg-[#0f172a] rounded p-1 border border-[#30363D]">
-          {['v2', 'v3', 'climax_reversal'].map((strat) => (
+        <div className="flex flex-wrap bg-[#0f172a] rounded p-1 border border-[#30363D] gap-1">
+          {[
+            { id: 'v2', label: 'MODULE V2 (SMC)' },
+            { id: 'v3', label: 'MODULE V3 (SMC + EMA/BB)' },
+            { id: 'climax_reversal', label: 'CLIMAX REVERSAL' },
+            { id: 'volatility_compression_breakout', label: 'VOLATILITY COMPRESSION BREAKOUT' }
+          ].map((strat) => (
             <button
-              key={strat}
-              onClick={() => onUpdateSettings({ ...settings, activeStrategy: strat })}
-              className={`px-6 py-2 rounded text-xs font-bold transition-all ${
-                settings.activeStrategy === strat 
+              key={strat.id}
+              onClick={() => onUpdateSettings({ ...settings, activeStrategy: strat.id })}
+              className={`px-4 py-2 rounded text-xs font-bold transition-all ${
+                settings.activeStrategy === strat.id 
                   ? 'bg-emerald-500 text-[#0f172a]' 
                   : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800'
               }`}
             >
-              {strat === 'v2' ? 'MODULE V2 (SMC)' : strat === 'v3' ? 'MODULE V3 (SMC + EMA/BB)' : 'CLIMAX REVERSAL'}
+              {strat.label}
             </button>
           ))}
         </div>

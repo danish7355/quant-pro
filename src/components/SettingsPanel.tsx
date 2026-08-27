@@ -199,6 +199,28 @@ export default function SettingsPanel({ settings, onUpdateSettings, onResetBalan
                 ))}
               </div>
             </div>
+            <div className="flex justify-between items-center py-4 border-b border-gray-800/50">
+              <div className="flex flex-col">
+                <span className="text-sm font-bold text-gray-200">Active Strategy</span>
+                <span className="text-[11px] text-gray-500">Select active trading strategy engine.</span>
+              </div>
+              <div className="flex flex-wrap bg-[#0f172a] rounded p-1 border border-gray-800 gap-1">
+                {[
+                  { id: 'v2', label: 'V2 (SMC)' },
+                  { id: 'v3', label: 'V3 (EMA/BB)' },
+                  { id: 'climax_reversal', label: 'Climax' },
+                  { id: 'volatility_compression_breakout', label: 'Compression Breakout' }
+                ].map((s) => (
+                  <button
+                    key={s.id}
+                    onClick={() => handleInputChange('activeStrategy', s.id)}
+                    className={`px-3 py-1 rounded text-xs font-bold transition-all ${settings.activeStrategy === s.id || (!settings.activeStrategy && s.id === 'v2') ? 'bg-[#00e696] text-[#0f172a]' : 'text-gray-400 hover:text-gray-200'}`}
+                  >
+                    {s.label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <InputRow label="Scan Interval (Secs)" desc="How often the scanner runs" value={settings.scanInterval} onChange={(v: any) => handleInputChange('scanInterval', v)} />
             <InputRow label="Coins to Scan" desc="Number of top coins by volume to scan" value={settings.coinCount} onChange={(v: any) => handleInputChange('coinCount', v)} />
             

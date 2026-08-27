@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { CoinDetail, Position, TradeLog, AppSettings, EquitySnapshot, Timeframe } from '../types';
 import { runScoringEngine } from '../utils/indicators';
-import { manageOpenPositionV3 } from '../utils/tradeManager';
+import { manageOpenPositionV3, manageCompressionBreakoutPosition } from '../utils/tradeManager';
 import { db } from './firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 
@@ -457,7 +457,24 @@ function openPosition(coin: CoinDetail) {
   const supportsBelow = [...new Set(coin.indicators.supportResistance.supports)].filter(s => s < coin.price).sort((a, b) => b - a);
   const resistancesAbove = [...new Set(coin.indicators.supportResistance.resistances)].filter(r => r > coin.price).sort((a, b) => a - b);
 
-  if (coin.direction === 'LONG') {
+  let windowHigh = coin.indicators.compressionState?.windowHigh;
+  let windowLow = coin.indicators.compressionState?.windowLow;
+
+  if (state.settings.activeStrategy === 'volatility_compression_breakout' || state.settings.activeStrategy === 'compression_breakout') {
+    const effectiveWindowLow = windowLow ?? (coin.price - atr * 1.5);
+    const effectiveWindowHigh = windowHigh ?? (coin.price + atr * 1.5);
+    if (coin.direction === 'LONG') {
+      sl = effectiveWindowLow - 0.3 * atr;
+      tp1 = coin.price + 1.5 * atr;
+      tp2 = coin.price + 3.0 * atr;
+      tp3 = coin.price + 5.0 * atr;
+    } else {
+      sl = effectiveWindowHigh + 0.3 * atr;
+      tp1 = coin.price - 1.5 * atr;
+      tp2 = coin.price - 3.0 * atr;
+      tp3 = coin.price - 5.0 * atr;
+    }
+  } else if (coin.direction === 'LONG') {
     const validSupports = supportsBelow.filter(s => s < coin.price - (atr * 0.2));
     sl = validSupports.length > 0 ? validSupports[0] - buffer : coin.price - (atr * state.settings.slAtrMultiple);
     
@@ -517,7 +534,10 @@ function openPosition(coin: CoinDetail) {
     maxProfitablePrice: coin.price,
     unrealizedPnl: 0,
     realizedPnl: 0,
-    sizeRemainingPct: 100
+    sizeRemainingPct: 100,
+    windowHigh,
+    windowLow,
+    barsOpen: 0
   };
 
   state.positions.push(newPos);
@@ -681,6 +701,43 @@ export function handlePriceUpdate(tickers: { symbol: string; price: number }[]) 
     const isLong = p.direction === 'LONG';
     let closedReason: TradeLog['exitReason'] | null = null;
     const pnl = isLong ? (currentPrice - p.entryPrice) * p.quantity : (p.entryPrice - currentPrice) * p.quantity;
+
+    if (state.settings.activeStrategy === 'volatility_compression_breakout' || state.settings.activeStrategy === 'compression_breakout') {
+      const result = manageCompressionBreakoutPosition(
+        p,
+        { open: currentPrice, high: currentPrice, low: currentPrice, close: currentPrice },
+        p.entryAtr || currentPrice * 0.02,
+        p.barsOpen || 0
+      );
+
+      if (result.action === 'EXIT') {
+        closePosition({ ...p, currentPrice, unrealizedPnl: pnl }, result.reason as any);
+        positionModified = true;
+      } else if (result.action.startsWith('PARTIAL') && result.partialRatio) {
+        closePartialPosition({ ...p, currentPrice, unrealizedPnl: pnl }, result.reason as any, result.partialRatio);
+        positionModified = true;
+
+        const idx = state.positions.findIndex(pos => pos.id === p.id);
+        if (idx !== -1) {
+          const shrinkRatio = result.updatedPosition.sizeRemainingPct / state.positions[idx].sizeRemainingPct;
+          state.positions[idx].quantity *= shrinkRatio;
+          state.positions[idx].allocatedBalance *= shrinkRatio;
+          state.positions[idx].sizeRemainingPct = result.updatedPosition.sizeRemainingPct;
+          state.positions[idx].initialTpHit = true;
+        }
+      }
+
+      const idx = state.positions.findIndex(pos => pos.id === p.id);
+      if (idx !== -1 && result.action !== 'EXIT') {
+        state.positions[idx].currentPrice = currentPrice;
+        state.positions[idx].unrealizedPnl = isLong ? (currentPrice - state.positions[idx].entryPrice) * state.positions[idx].quantity : (state.positions[idx].entryPrice - currentPrice) * state.positions[idx].quantity;
+        state.positions[idx].maxProfitablePrice = result.updatedPosition.maxProfitablePrice;
+        state.positions[idx].trailingStop = result.updatedPosition.trailingStop;
+        state.positions[idx].trailingStopActive = result.updatedPosition.trailingStopActive;
+        state.positions[idx].barsOpen = result.updatedPosition.barsOpen;
+      }
+      return;
+    }
 
     if (state.settings.activeStrategy === 'v3' || state.settings.activeStrategy === 'climax_reversal') {
       const timeOpen = new Date(p.timeOpen).getTime();

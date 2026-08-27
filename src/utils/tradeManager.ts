@@ -138,3 +138,140 @@ export function manageOpenPositionV3(
 
   return { action: 'NONE', updatedPosition: newPos };
 }
+
+// =======================================================
+// VOLATILITY COMPRESSION BREAKOUT - TREND-FOLLOWING EXIT
+// =======================================================
+export interface CompressionBreakoutConfig {
+  initial_tp_atr_mult: number;    // 1.5 ATR
+  initial_tp_close_pct: number;   // 0.25 (25% initial bank)
+  chandelier_atr_mult: number;    // 3.0 ATR trail
+  round_trip_cost_pct: number;    // 0.0015 (0.15% fee + slippage buffer)
+  stall_check_bar: number;        // 8 bars
+  stall_min_progress_atr: number; // 1.0 ATR min progress
+}
+
+export const defaultCompressionBreakoutConfig: CompressionBreakoutConfig = {
+  initial_tp_atr_mult: 1.5,
+  initial_tp_close_pct: 0.25,
+  chandelier_atr_mult: 3.0,
+  round_trip_cost_pct: 0.0015,
+  stall_check_bar: 8,
+  stall_min_progress_atr: 1.0
+};
+
+export function manageCompressionBreakoutPosition(
+  pos: Position,
+  candle: Candle,
+  currentAtr: number,
+  barsOpen: number = 0,
+  config: CompressionBreakoutConfig = defaultCompressionBreakoutConfig
+): TradeManagerResult {
+  const isLong = pos.direction === 'LONG';
+  let newPos = { ...pos };
+  newPos.barsOpen = (newPos.barsOpen || 0) + 1;
+
+  // Step 1: Check Fake Breakout Invalidation on bar 1 after entry
+  if (newPos.barsOpen === 1 && typeof newPos.windowHigh === 'number' && typeof newPos.windowLow === 'number') {
+    const isFake = isLong
+      ? candle.close < newPos.windowHigh // snapped back inside the box
+      : candle.close > newPos.windowLow;
+
+    if (isFake) {
+      return {
+        action: 'EXIT',
+        exitPrice: candle.close,
+        reason: 'INVALIDATION',
+        updatedPosition: newPos
+      };
+    }
+  }
+
+  // Step 2: Track peak favorable excursion
+  const extreme = isLong ? candle.high : candle.low;
+  newPos.maxProfitablePrice = newPos.maxProfitablePrice || newPos.entryPrice;
+  if (isLong) {
+    newPos.maxProfitablePrice = Math.max(newPos.maxProfitablePrice, extreme);
+  } else {
+    newPos.maxProfitablePrice = Math.min(newPos.maxProfitablePrice, extreme);
+  }
+
+  // Step 3: Check Stall Condition (before initial TP)
+  const initialTpHit = newPos.initialTpHit || (newPos.sizeRemainingPct < 100);
+  if (!initialTpHit && newPos.barsOpen >= config.stall_check_bar) {
+    const unrealizedMoveAtr = isLong
+      ? (candle.close - newPos.entryPrice) / (newPos.entryAtr || currentAtr)
+      : (newPos.entryPrice - candle.close) / (newPos.entryAtr || currentAtr);
+
+    if (unrealizedMoveAtr < config.stall_min_progress_atr) {
+      return {
+        action: 'EXIT',
+        exitPrice: candle.close,
+        reason: 'STALL_EXIT',
+        updatedPosition: newPos
+      };
+    }
+  }
+
+  // Step 4: Evaluate Initial Take Profit (25% close at 1.5 ATR)
+  const initialTpLevel = isLong
+    ? newPos.entryPrice + config.initial_tp_atr_mult * (newPos.entryAtr || currentAtr)
+    : newPos.entryPrice - config.initial_tp_atr_mult * (newPos.entryAtr || currentAtr);
+
+  const reachedInitialTp = isLong ? candle.high >= initialTpLevel : candle.low <= initialTpLevel;
+
+  if (reachedInitialTp && !initialTpHit && newPos.sizeRemainingPct === 100) {
+    newPos.initialTpHit = true;
+    newPos.trailingStopActive = true;
+    const costBuffer = newPos.entryPrice * config.round_trip_cost_pct;
+    // Move SL to breakeven + round-trip cost buffer
+    newPos.trailingStop = isLong ? newPos.entryPrice + costBuffer : newPos.entryPrice - costBuffer;
+    newPos.sizeRemainingPct = Math.round(100 - (config.initial_tp_close_pct * 100)); // 75% remaining
+
+    return {
+      action: 'PARTIAL_TP1',
+      exitPrice: initialTpLevel,
+      reason: 'TP1',
+      partialRatio: config.initial_tp_close_pct,
+      updatedPosition: newPos
+    };
+  }
+
+  // Step 5: Chandelier Trailing Stop (once initial TP hit, trail 3.0 ATR behind peak extreme)
+  if (initialTpHit || newPos.trailingStopActive) {
+    const candidateStop = isLong
+      ? newPos.maxProfitablePrice - config.chandelier_atr_mult * currentAtr
+      : newPos.maxProfitablePrice + config.chandelier_atr_mult * currentAtr;
+
+    const currentStop = newPos.trailingStop || newPos.sl;
+    // Ratchet only in favorable direction
+    newPos.trailingStop = isLong ? Math.max(currentStop, candidateStop) : Math.min(currentStop, candidateStop);
+    newPos.trailingStopActive = true;
+  } else {
+    newPos.trailingStop = newPos.sl;
+  }
+
+  // Step 6: Stop Check
+  const effectiveStop = newPos.trailingStop || newPos.sl;
+  if (isLong) {
+    if (candle.low <= effectiveStop) {
+      return {
+        action: 'EXIT',
+        exitPrice: effectiveStop,
+        reason: newPos.trailingStopActive ? 'TS' : 'SL',
+        updatedPosition: newPos
+      };
+    }
+  } else {
+    if (candle.high >= effectiveStop) {
+      return {
+        action: 'EXIT',
+        exitPrice: effectiveStop,
+        reason: newPos.trailingStopActive ? 'TS' : 'SL',
+        updatedPosition: newPos
+      };
+    }
+  }
+
+  return { action: 'NONE', updatedPosition: newPos };
+}
