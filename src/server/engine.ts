@@ -336,12 +336,12 @@ async function fetchKlines(symbol: string, timeframe: Timeframe) {
   if (binanceTf === '1d') binanceTf = '1d';
   
   const endpoints = [
-    `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=210`,
-    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${binanceTf}&limit=210`,
-    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=210`,
-    `https://api1.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=210`,
-    `https://api2.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=210`,
-    `https://api3.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=210`
+    `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
+    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
+    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
+    `https://api1.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
+    `https://api2.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`,
+    `https://api3.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceTf}&limit=300`
   ];
 
   let data: any = null;
@@ -416,7 +416,7 @@ export async function scanMarkets() {
     });
   }
   
-  state.coins = updatedCoins.sort((a, b) => b.score - a.score);
+  state.coins = updatedCoins.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
   processAutoTradingRules(state.coins);
 }
 

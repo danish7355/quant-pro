@@ -678,12 +678,10 @@ export function runScoringEngine(
       const priorMoveAtr = (boxAtr || curAtr) > 0 ? priorMoveRange / (boxAtr || curAtr) : 0;
       const hasPriorImpulse = priorMoveAtr >= PRIOR_MOVE_ATR_MIN;
 
-      // Compression check (now includes volume contraction + prior impulse)
+      // Compression check (core gates only — volume contraction & prior impulse are scoring bonuses)
       const atrRatio = boxAtr / (atrAvg50 || boxAtr);
       const isCompressed = (atrRatio <= COMPRESSION_ATR_RATIO_MAX) &&
-        (windowRange <= COMPRESSION_WINDOW_ATR_MULT * (boxAtr || curAtr)) &&
-        hasVolumeContraction &&
-        hasPriorImpulse;
+        (windowRange <= COMPRESSION_WINDOW_ATR_MULT * (boxAtr || curAtr));
 
       // Save compression state to completeIndDetails
       completeIndDetails.compressionState = {
@@ -737,10 +735,22 @@ export function runScoringEngine(
           baseScore = Math.max(45, baseScore - 10); // penalty for weak body
         }
 
-        // ── NEW: Volume Contraction Quality Bonus ──
-        // Tighter contraction = more coil energy = higher score
-        if (volumeContractionRatio <= 0.35) {
-          baseScore = Math.min(100, baseScore + 8); // extreme contraction bonus
+        // ── Volume Contraction Quality Bonus/Penalty ──
+        // Real coils have volume drying up; reward that pattern
+        if (hasVolumeContraction) {
+          const contractionBonus = volumeContractionRatio <= 0.35 ? 12 : 6;
+          baseScore = Math.min(100, baseScore + contractionBonus);
+        } else {
+          baseScore = Math.max(45, baseScore - 8); // no contraction = weaker setup
+        }
+
+        // ── Prior Impulse Quality Bonus/Penalty ──
+        // Setups after a sharp move have more stored energy
+        if (hasPriorImpulse) {
+          const impulseBonus = priorMoveAtr >= 5.0 ? 10 : 5;
+          baseScore = Math.min(100, baseScore + impulseBonus);
+        } else {
+          baseScore = Math.max(45, baseScore - 5); // no prior move = weaker
         }
 
         // HTF Bonus (50 EMA Slope)
