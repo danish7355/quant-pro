@@ -11,67 +11,73 @@ export interface PositionSizeResult {
   allocatedMargin: number;
   quantity: number;
   leverage: number;
+  riskAmountUsd: number;
   reason?: string;
 }
 
 export function calculatePositionSize(
   accountBalance: number,
-  riskPct: number, // e.g. 1%
+  riskPct: number, // e.g. 1% or 2%
   positionSizePct: number, // e.g. 10%
   entryPrice: number,
   stopPrice: number,
   leverageSetting: number,
   maxLeverageCap: number = 20,
-  maxExposurePct: number = 60,
+  maxExposurePct: number = 80,
   currentTotalExposureUsd: number = 0
 ): PositionSizeResult {
   if (accountBalance <= 0 || entryPrice <= 0) {
-    return { allowed: false, positionSizeUsd: 0, allocatedMargin: 0, quantity: 0, leverage: 1, reason: 'Invalid balance or entry price' };
+    return { allowed: false, positionSizeUsd: 0, allocatedMargin: 0, quantity: 0, leverage: 1, riskAmountUsd: 0, reason: 'Invalid balance or entry price' };
   }
 
-  // Cap leverage
+  const priceDistance = Math.abs(entryPrice - stopPrice);
+  if (priceDistance <= 0) {
+    return { allowed: false, positionSizeUsd: 0, allocatedMargin: 0, quantity: 0, leverage: 1, riskAmountUsd: 0, reason: 'Stop price equals entry price' };
+  }
+
   const effectiveLeverage = Math.min(Math.max(1, leverageSetting), maxLeverageCap);
+  const riskAmountUsd = accountBalance * (riskPct / 100);
 
-  // Position size in USD based on positionSizePct of balance
-  const rawMargin = accountBalance * (positionSizePct / 100);
-  const positionSizeUsd = rawMargin * effectiveLeverage;
+  // 1. Quantity strictly based on Account Risk % (loss at SL = riskAmountUsd)
+  let qtyByRisk = riskAmountUsd / priceDistance;
+  let marginByRisk = (qtyByRisk * entryPrice) / effectiveLeverage;
 
-  // Exposure Cap check
-  const maxAllowedTotalExposureUsd = accountBalance * (maxExposurePct / 100);
-  if (currentTotalExposureUsd + positionSizeUsd > maxAllowedTotalExposureUsd) {
+  // 2. Cap by max position margin % (e.g. 10% of balance per trade)
+  const maxTradeMargin = accountBalance * (positionSizePct / 100);
+  if (marginByRisk > maxTradeMargin) {
+    marginByRisk = maxTradeMargin;
+    qtyByRisk = (marginByRisk * effectiveLeverage) / entryPrice;
+  }
+
+  // 3. Cap by total available account margin
+  const maxAvailableMargin = Math.max(0, (accountBalance * (maxExposurePct / 100)) - currentTotalExposureUsd);
+  if (marginByRisk > maxAvailableMargin) {
+    marginByRisk = maxAvailableMargin;
+    qtyByRisk = (marginByRisk * effectiveLeverage) / entryPrice;
+  }
+
+  // Balance sanity guard
+  if (marginByRisk <= 0 || qtyByRisk <= 0 || marginByRisk > accountBalance * 0.95) {
     return {
       allowed: false,
       positionSizeUsd: 0,
       allocatedMargin: 0,
       quantity: 0,
       leverage: effectiveLeverage,
-      reason: `Total exposure cap (${maxExposurePct}%) exceeded: current $${currentTotalExposureUsd.toFixed(2)} + new $${positionSizeUsd.toFixed(2)} > $${maxAllowedTotalExposureUsd.toFixed(2)}`
+      riskAmountUsd,
+      reason: `Insufficient margin capacity (Calculated margin: $${marginByRisk.toFixed(2)}, Available: $${maxAvailableMargin.toFixed(2)})`
     };
   }
 
-  // Account Risk % Check: Loss if SL hit should not exceed (accountBalance * riskPct / 100)
-  const priceDistance = Math.abs(entryPrice - stopPrice);
-  const quantityByMargin = positionSizeUsd / entryPrice;
-  const potentialLoss = quantityByMargin * priceDistance;
-  const maxRiskLoss = accountBalance * (riskPct / 100);
-
-  let finalQuantity = quantityByMargin;
-  let finalPositionSizeUsd = positionSizeUsd;
-  let finalAllocatedMargin = rawMargin;
-
-  // Scale down quantity if risk loss exceeds maxRiskLoss
-  if (potentialLoss > maxRiskLoss && priceDistance > 0) {
-    finalQuantity = maxRiskLoss / priceDistance;
-    finalPositionSizeUsd = finalQuantity * entryPrice;
-    finalAllocatedMargin = finalPositionSizeUsd / effectiveLeverage;
-  }
+  const positionSizeUsd = qtyByRisk * entryPrice;
 
   return {
     allowed: true,
-    positionSizeUsd: finalPositionSizeUsd,
-    allocatedMargin: finalAllocatedMargin,
-    quantity: finalQuantity,
+    positionSizeUsd,
+    allocatedMargin: marginByRisk,
+    quantity: qtyByRisk,
     leverage: effectiveLeverage,
+    riskAmountUsd
   };
 }
 

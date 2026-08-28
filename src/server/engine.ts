@@ -4,6 +4,7 @@ import * as path from 'path';
 import { CoinDetail, Position, TradeLog, AppSettings, EquitySnapshot, Timeframe } from '../types';
 import { runScoringEngine } from '../utils/indicators';
 import { manageOpenPositionV3, manageCompressionBreakoutPosition } from '../utils/tradeManager';
+import { calculatePositionSize } from '../utils/riskManager';
 import { db } from './firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 
@@ -506,15 +507,26 @@ function openPosition(coin: CoinDetail) {
     return;
   }
 
-  const riskAmount = state.balance * (state.settings.accountRiskPct / 100);
-  const qty = riskAmount / slDist;
-  const allocatedBalance = (coin.price * qty) / state.settings.leverage;
+  const currentTotalExposureUsd = state.positions.reduce((sum, p) => sum + p.allocatedBalance, 0);
+  const sizeRes = calculatePositionSize(
+    state.balance,
+    state.settings.accountRiskPct,
+    state.settings.positionSizePct || 10,
+    coin.price,
+    sl,
+    state.settings.leverage,
+    20,
+    80,
+    currentTotalExposureUsd
+  );
 
-  // Balance guard: ensure we have enough balance to allocate
-  if (allocatedBalance <= 0 || allocatedBalance > state.balance * 0.95) {
-    addTerminalLog(`⚠️ Skipped ${coin.symbol}: Insufficient balance ($${state.balance.toFixed(2)}) for margin $${allocatedBalance.toFixed(2)}`);
+  if (!sizeRes.allowed || sizeRes.quantity <= 0) {
+    addTerminalLog(`⚠️ Skipped ${coin.symbol}: ${sizeRes.reason || 'Position sizing rejected'}`);
     return;
   }
+
+  const qty = sizeRes.quantity;
+  const allocatedBalance = sizeRes.allocatedMargin;
 
   const newPos: Position = {
     id: Math.random().toString(36).substr(2, 9),
