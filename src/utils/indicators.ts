@@ -843,109 +843,99 @@ export function runScoringEngine(
   }
 
   if (params.activeStrategy === 'climax_reversal') {
-    // climax_reversal logic
     const climax_lookback = 20;
-    const ema_baseline_period = 200;
     const atr_average_period = 50;
-    
-    const min_overextension_atr = 2.0;
-    const min_atr_vs_average = 1.0;
-    const min_rejection_wick_ratio = 0.45;
-    const min_climax_range_ratio = 1.3;
-    const min_stop_distance_atr = 0.5;
+    const ema_baseline_period = 50;
+    const min_overextension_atr = 1.5;
+    const min_rejection_wick_ratio = 0.35;
+    const min_climax_range_ratio = 1.2;
 
-    if (closes.length >= Math.max(climax_lookback, atr_average_period, ema_baseline_period) + 5) {
-      const c1Idx = idx - 2;
-      const c2Idx = idx - 1;
-      const c3Idx = idx;
+    if (closes.length >= Math.max(climax_lookback, atr_average_period, ema_baseline_period) + 10) {
+      // Precompute TR and ATR
+      const tr = Array(idx + 1).fill(0);
+      for (let j = 1; j <= idx; j++) {
+        tr[j] = Math.max(highs[j] - lows[j], Math.abs(highs[j] - closes[j - 1]), Math.abs(lows[j] - closes[j - 1]));
+      }
+      const curAtr = tr.slice(idx - (params.atrPeriod || 14) + 1, idx + 1).reduce((a, b) => a + b, 0) / (params.atrPeriod || 14);
 
-      const getRow = (i) => {
-        const tr = Array(i + 1).fill(0);
-        for(let j=1; j<=i; j++) {
-          tr[j] = Math.max(highs[j] - lows[j], Math.abs(highs[j] - closes[j-1]), Math.abs(lows[j] - closes[j-1]));
+      let atrSum = 0;
+      for (let j = idx - atr_average_period + 1; j <= idx; j++) {
+        const subTr = tr.slice(j - (params.atrPeriod || 14) + 1, j + 1).reduce((a, b) => a + b, 0) / (params.atrPeriod || 14);
+        atrSum += subTr;
+      }
+      const atrAvg = atrSum / atr_average_period;
+
+      let rangeSum = 0;
+      for (let j = idx - climax_lookback + 1; j <= idx; j++) {
+        rangeSum += (highs[j] - lows[j]);
+      }
+      const avgRange = rangeSum / climax_lookback;
+
+      const emaBaselineAll = calculateEMA(closes.slice(0, idx + 1), ema_baseline_period);
+      const emaBaseline = emaBaselineAll[emaBaselineAll.length - 1];
+
+      // Scan the last 6 candles for swing top / bottom exhaustion
+      const scanWindow = 6;
+      let topExtreme = -Infinity;
+      let topIdx = idx;
+      let bottomExtreme = Infinity;
+      let bottomIdx = idx;
+
+      for (let j = idx - scanWindow + 1; j <= idx; j++) {
+        if (highs[j] > topExtreme) {
+          topExtreme = highs[j];
+          topIdx = j;
         }
-        const curAtr = tr.slice(i - (params.atrPeriod || 14) + 1, i + 1).reduce((a,b)=>a+b,0) / (params.atrPeriod || 14);
-        
-        let atrSum = 0;
-        for(let j=i-atr_average_period+1; j<=i; j++) {
-           const subTr = tr.slice(j - (params.atrPeriod || 14) + 1, j + 1).reduce((a,b)=>a+b,0) / (params.atrPeriod || 14);
-           atrSum += subTr;
-        }
-        const atrAvg = atrSum / atr_average_period;
-
-        let rangeSum = 0;
-        for(let j=i-climax_lookback+1; j<=i; j++) {
-           rangeSum += (highs[j] - lows[j]);
-        }
-        const avgRange = rangeSum / climax_lookback;
-
-        const emaBaselineAll = calculateEMA(closes.slice(0, i + 1), ema_baseline_period);
-        const emaBaseline = emaBaselineAll[emaBaselineAll.length - 1];
-
-        const range = highs[i] - lows[i];
-        
-        let wickRatio = 0;
-        if (range > 0) {
-          const bodyTop = Math.max(candles[i].open, closes[i]);
-          const bodyBottom = Math.min(candles[i].open, closes[i]);
-          if (closes[i] < candles[i].open) {
-            wickRatio = (highs[i] - bodyTop) / range;
-          } else {
-            wickRatio = (bodyBottom - lows[i]) / range;
-          }
-        }
-
-        return {
-          open: candles[i].open, high: highs[i], low: lows[i], close: closes[i],
-          range, avgRange, atr: curAtr, atrAvg, emaBaseline, wickRatio
-        };
-      };
-
-      const c1 = getRow(c1Idx);
-      const c2 = getRow(c2Idx);
-      const c3 = getRow(c3Idx);
-
-      const isClimaxC1 = c1.range >= min_climax_range_ratio * c1.avgRange;
-      const isOverextendedC1 = Math.abs(c1.close - c1.emaBaseline) >= min_overextension_atr * c1.atr;
-      const isVolOkC1 = c1.atr >= min_atr_vs_average * c1.atrAvg;
-
-      let crDirection = 'NEUTRAL';
-      let crReason = '';
-
-      if (
-        c1.close > c1.open &&
-        isClimaxC1 && isOverextendedC1 && isVolOkC1 &&
-        c2.close < c2.open &&
-        c2.wickRatio >= min_rejection_wick_ratio &&
-        c2.high >= c1.high
-      ) {
-        const triggerLevel = c2.low;
-        if (c3.close < triggerLevel) {
-           crDirection = 'SHORT';
-           crReason = 'All gates passed';
+        if (lows[j] < bottomExtreme) {
+          bottomExtreme = lows[j];
+          bottomIdx = j;
         }
       }
 
-      if (crDirection === 'NEUTRAL' &&
-        c1.close < c1.open &&
-        isClimaxC1 && isOverextendedC1 && isVolOkC1 &&
-        c2.close > c2.open &&
-        c2.wickRatio >= min_rejection_wick_ratio &&
-        c2.low <= c1.low
-      ) {
-        const triggerLevel = c2.high;
-        if (c3.close > triggerLevel) {
-           crDirection = 'LONG';
-           crReason = 'All gates passed';
+      // Check for Top Exhaustion (Sell at Top / SHORT)
+      const topOverextended = (topExtreme - emaBaseline) >= min_overextension_atr * curAtr;
+      let topWickCount = 0;
+      let topClimaxCandle = false;
+      for (let j = Math.max(0, topIdx - 2); j <= Math.min(idx, topIdx + 2); j++) {
+        const r = highs[j] - lows[j];
+        if (r > 0) {
+          const bodyTop = Math.max(candles[j].open, closes[j]);
+          const upperWick = (highs[j] - bodyTop) / r;
+          if (upperWick >= min_rejection_wick_ratio) topWickCount++;
+          if (r >= min_climax_range_ratio * avgRange) topClimaxCandle = true;
         }
       }
 
-      if (crDirection !== 'NEUTRAL') {
+      // Check for Bottom Exhaustion (Buy at Bottom / LONG)
+      const bottomOverextended = (emaBaseline - bottomExtreme) >= min_overextension_atr * curAtr;
+      let bottomWickCount = 0;
+      let bottomClimaxCandle = false;
+      for (let j = Math.max(0, bottomIdx - 2); j <= Math.min(idx, bottomIdx + 2); j++) {
+        const r = highs[j] - lows[j];
+        if (r > 0) {
+          const bodyBottom = Math.min(candles[j].open, closes[j]);
+          const lowerWick = (bodyBottom - lows[j]) / r;
+          if (lowerWick >= min_rejection_wick_ratio) bottomWickCount++;
+          if (r >= min_climax_range_ratio * avgRange) bottomClimaxCandle = true;
+        }
+      }
+
+      // Trigger Evaluation:
+      // For SHORT: price made a top and is now breaking below the low of the rejection candle(s)
+      const curCandle = candles[idx];
+      const topTriggerLevel = Math.min(...lows.slice(Math.max(0, topIdx - 1), topIdx + 1));
+      const isShortTriggered = topOverextended && (topWickCount >= 1 || topClimaxCandle) && curCandle.close < topTriggerLevel && closes[idx] < closes[idx - 1];
+
+      // For LONG: price made a bottom and is now breaking above the high of the rejection candle(s)
+      const bottomTriggerLevel = Math.max(...highs.slice(Math.max(0, bottomIdx - 1), bottomIdx + 1));
+      const isLongTriggered = bottomOverextended && (bottomWickCount >= 1 || bottomClimaxCandle) && curCandle.close > bottomTriggerLevel && closes[idx] > closes[idx - 1];
+
+      if (isShortTriggered) {
         return {
-          score: crDirection === 'SHORT' ? -100 : 100,
-          direction: crDirection,
+          score: -100,
+          direction: 'SHORT',
           status: 'CLIMAX_REVERSAL',
-          reason: crReason,
+          reason: `All gates passed | Top Exhaustion Reversal (Overextended +${((topExtreme - emaBaseline) / curAtr).toFixed(1)} ATR, Wicks: ${topWickCount}, Triggered below ${topTriggerLevel})`,
           indicators: completeIndDetails,
           gates: { ...defaultGates, g1: true, g2: true, g3: true, g4: true, g5: true, g6: true, g7: true, g8: true, g9: true, g10: true, blockReasons: [] },
           wmPattern: 'NONE',
@@ -953,79 +943,57 @@ export function runScoringEngine(
         };
       }
 
-      // --- Climax Proximity Score ---
-      // Instead of returning 0, compute how close the market is to a climax reversal.
-      // Each sub-condition contributes to the proximity score so the scanner shows useful data.
-      let climaxProximity = 0;
-      const proximityReasons: string[] = [];
-
-      // Check C1 sub-conditions independently for BOTH directions
-      if (isClimaxC1) { climaxProximity += 15; proximityReasons.push('C1 range climax'); }
-      if (isOverextendedC1) { climaxProximity += 20; proximityReasons.push('C1 overextended'); }
-      if (isVolOkC1) { climaxProximity += 10; proximityReasons.push('C1 vol expansion'); }
-
-      // Check if C2 shows rejection characteristics
-      if (c2.wickRatio >= min_rejection_wick_ratio) { climaxProximity += 15; proximityReasons.push('C2 rejection wick'); }
-      
-      // Check if C2 made new extreme beyond C1
-      const c2MadeNewHigh = c2.high >= c1.high;
-      const c2MadeNewLow = c2.low <= c1.low;
-      if (c2MadeNewHigh || c2MadeNewLow) { climaxProximity += 10; proximityReasons.push('C2 new extreme'); }
-
-      // Check bearish/bullish reversal candle structure
-      const c1Bullish = c1.close > c1.open;
-      const c1Bearish = c1.close < c1.open;
-      const c2Bearish = c2.close < c2.open;
-      const c2Bullish = c2.close > c2.open;
-
-      if ((c1Bullish && c2Bearish) || (c1Bearish && c2Bullish)) {
-        climaxProximity += 15; proximityReasons.push('C1→C2 reversal');
+      if (isLongTriggered) {
+        return {
+          score: 100,
+          direction: 'LONG',
+          status: 'CLIMAX_REVERSAL',
+          reason: `All gates passed | Bottom Exhaustion Reversal (Overextended -${((emaBaseline - bottomExtreme) / curAtr).toFixed(1)} ATR, Wicks: ${bottomWickCount}, Triggered above ${bottomTriggerLevel})`,
+          indicators: completeIndDetails,
+          gates: { ...defaultGates, g1: true, g2: true, g3: true, g4: true, g5: true, g6: true, g7: true, g8: true, g9: true, g10: true, blockReasons: [] },
+          wmPattern: 'NONE',
+          regime
+        };
       }
 
-      // Determine the strongest direction from what we see
-      let proximityDir: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL';
-      if (c1Bullish && c2Bearish && c2MadeNewHigh) {
-        proximityDir = 'SHORT'; // Bearish climax reversal building
-      } else if (c1Bearish && c2Bullish && c2MadeNewLow) {
-        proximityDir = 'LONG'; // Bullish climax reversal building
+      // Proximity scoring when forming top/bottom
+      let score = 0;
+      let dir: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL';
+      const reasons: string[] = [];
+
+      if (topOverextended && (topExtreme > (bottomExtreme + 2 * curAtr))) {
+        dir = 'SHORT';
+        score += 35;
+        reasons.push(`Top overextended (+${((topExtreme - emaBaseline) / curAtr).toFixed(1)} ATR)`);
+        if (topWickCount > 0) { score += 25; reasons.push(`Rejection wicks (${topWickCount})`); }
+        if (topClimaxCandle) { score += 15; reasons.push('Climax volume/range'); }
+        if (curCandle.close < topExtreme - 0.5 * curAtr) { score += 15; reasons.push('Rolling over from high'); }
+      } else if (bottomOverextended) {
+        dir = 'LONG';
+        score += 35;
+        reasons.push(`Bottom overextended (-${((emaBaseline - bottomExtreme) / curAtr).toFixed(1)} ATR)`);
+        if (bottomWickCount > 0) { score += 25; reasons.push(`Rejection wicks (${bottomWickCount})`); }
+        if (bottomClimaxCandle) { score += 15; reasons.push('Climax volume/range'); }
+        if (curCandle.close > bottomExtreme + 0.5 * curAtr) { score += 15; reasons.push('Bouncing from low'); }
       }
 
-      // Check trigger proximity on C3
-      if (proximityDir === 'SHORT') {
-        const triggerLevel = c2.low;
-        const distToTrigger = ((c3.close - triggerLevel) / triggerLevel) * 100;
-        if (distToTrigger < 0.5) { climaxProximity += 15; proximityReasons.push('C3 near trigger'); }
-      } else if (proximityDir === 'LONG') {
-        const triggerLevel = c2.high;
-        const distToTrigger = ((triggerLevel - c3.close) / triggerLevel) * 100;
-        if (distToTrigger < 0.5) { climaxProximity += 15; proximityReasons.push('C3 near trigger'); }
-      }
-
-      // Cap at 95 (100 is reserved for confirmed signals)
-      climaxProximity = Math.min(climaxProximity, 95);
+      score = Math.min(score, 90);
 
       const climaxGates = { ...defaultGates, blockReasons: [] as string[] };
       climaxGates.g1 = true;
-      climaxGates.g2 = true;
-      climaxGates.g3 = isClimaxC1;
-      climaxGates.g4 = isOverextendedC1;
-      climaxGates.g5 = isVolOkC1;
-      climaxGates.g6 = c2.wickRatio >= min_rejection_wick_ratio;
-      climaxGates.g7 = (c2MadeNewHigh || c2MadeNewLow);
-      climaxGates.g8 = (c1Bullish && c2Bearish) || (c1Bearish && c2Bullish);
+      climaxGates.g3 = topOverextended || bottomOverextended;
+      climaxGates.g4 = topWickCount > 0 || bottomWickCount > 0 || topClimaxCandle || bottomClimaxCandle;
+      climaxGates.g5 = isShortTriggered || isLongTriggered;
 
-      if (!climaxGates.g3) climaxGates.blockReasons.push('C1 range not climactic');
-      if (!climaxGates.g4) climaxGates.blockReasons.push('C1 not overextended from EMA200');
-      if (!climaxGates.g5) climaxGates.blockReasons.push('ATR below average (low volatility)');
-      if (!climaxGates.g6) climaxGates.blockReasons.push('C2 no rejection wick');
-      if (!climaxGates.g7) climaxGates.blockReasons.push('C2 no new extreme');
-      if (!climaxGates.g8) climaxGates.blockReasons.push('No C1→C2 reversal candle');
+      if (!climaxGates.g3) climaxGates.blockReasons.push('Price not overextended from baseline');
+      if (!climaxGates.g4) climaxGates.blockReasons.push('No rejection wicks or climax expansion');
+      if (!climaxGates.g5) climaxGates.blockReasons.push('Awaiting confirmation trigger break');
 
       return {
-        score: climaxProximity * (proximityDir === 'SHORT' ? -1 : 1),
-        direction: proximityDir,
-        status: climaxProximity >= 60 ? 'CLIMAX_BUILDING' : regime.label,
-        reason: proximityReasons.length > 0 ? proximityReasons.join(' | ') : 'No climax conditions met',
+        score: score * (dir === 'SHORT' ? -1 : 1),
+        direction: dir,
+        status: score >= 55 ? 'CLIMAX_BUILDING' : regime.label,
+        reason: reasons.length > 0 ? reasons.join(' | ') : 'No climax conditions detected',
         indicators: completeIndDetails,
         gates: climaxGates,
         wmPattern: 'NONE',
