@@ -464,35 +464,36 @@ function openPosition(coin: CoinDetail) {
 
   let windowHigh = coin.indicators.compressionState?.windowHigh;
   let windowLow = coin.indicators.compressionState?.windowLow;
+  const minSlDistance = atr * (state.settings.slAtrMultiple || 1.5);
 
   if (state.settings.activeStrategy === 'volatility_compression_breakout' || state.settings.activeStrategy === 'compression_breakout') {
     const effectiveWindowLow = windowLow ?? (coin.price - atr * 1.5);
     const effectiveWindowHigh = windowHigh ?? (coin.price + atr * 1.5);
     if (coin.direction === 'LONG') {
-      sl = effectiveWindowLow - 0.3 * atr;
+      sl = Math.min(effectiveWindowLow - 0.3 * atr, coin.price - minSlDistance);
       tp1 = coin.price + 1.5 * atr;
       tp2 = coin.price + 3.0 * atr;
       tp3 = coin.price + 5.0 * atr;
     } else {
-      sl = effectiveWindowHigh + 0.3 * atr;
+      sl = Math.max(effectiveWindowHigh + 0.3 * atr, coin.price + minSlDistance);
       tp1 = coin.price - 1.5 * atr;
       tp2 = coin.price - 3.0 * atr;
       tp3 = coin.price - 5.0 * atr;
     }
   } else if (coin.direction === 'LONG') {
-    const validSupports = supportsBelow.filter(s => s < coin.price - (atr * 0.2));
-    sl = validSupports.length > 0 ? validSupports[0] - buffer : coin.price - (atr * state.settings.slAtrMultiple);
+    const validSupports = supportsBelow.filter(s => s < coin.price - minSlDistance);
+    sl = validSupports.length > 0 ? validSupports[0] - buffer : coin.price - minSlDistance;
     
-    const validResistances = resistancesAbove.filter(r => r > coin.price + (atr * 0.2));
-    tp1 = validResistances.length > 0 ? validResistances[0] : coin.price + (atr * state.settings.tp1AtrMultiple);
+    const validResistances = resistancesAbove.filter(r => r > coin.price + (atr * 0.5));
+    tp1 = validResistances.length > 0 ? validResistances[0] : coin.price + (atr * (state.settings.tp1AtrMultiple || 2));
     tp2 = validResistances.length > 1 ? validResistances[1] : (tp1 + atr * 2);
     tp3 = validResistances.length > 2 ? validResistances[2] : (tp2 + atr * 2);
   } else {
-    const validResistances = resistancesAbove.filter(r => r > coin.price + (atr * 0.2));
-    sl = validResistances.length > 0 ? validResistances[0] + buffer : coin.price + (atr * state.settings.slAtrMultiple);
+    const validResistances = resistancesAbove.filter(r => r > coin.price + minSlDistance);
+    sl = validResistances.length > 0 ? validResistances[0] + buffer : coin.price + minSlDistance;
     
-    const validSupports = supportsBelow.filter(s => s < coin.price - (atr * 0.2));
-    tp1 = validSupports.length > 0 ? validSupports[0] : coin.price - (atr * state.settings.tp1AtrMultiple);
+    const validSupports = supportsBelow.filter(s => s < coin.price - (atr * 0.5));
+    tp1 = validSupports.length > 0 ? validSupports[0] : coin.price - (atr * (state.settings.tp1AtrMultiple || 2));
     tp2 = validSupports.length > 1 ? validSupports[1] : (tp1 - atr * 2);
     tp3 = validSupports.length > 2 ? validSupports[2] : (tp2 - atr * 2);
   }
@@ -600,7 +601,6 @@ export function closePartialPosition(pos: Position, reason: TradeLog["exitReason
   state.tradeLogs.unshift(log);
   if (state.tradeLogs.length > 500) state.tradeLogs.pop();
   scheduleStateSync();
-    if (state.tradeLogs.length > 500) state.tradeLogs.pop();
   state.equitySnapshots.push({ time: new Date().toISOString(), balance: state.balance });
   scheduleStateSync();
   addTerminalLog(`🔸 PARTIAL CLOSED ${pos.symbol} [${reason}] PNL: $${pnl.toFixed(2)}`);
@@ -722,12 +722,25 @@ export function handlePriceUpdate(tickers: { symbol: string; price: number }[]) 
     let closedReason: TradeLog['exitReason'] | null = null;
     const pnl = isLong ? (currentPrice - p.entryPrice) * p.quantity : (p.entryPrice - currentPrice) * p.quantity;
 
+    const timeOpenMs = new Date(p.timeOpen).getTime();
+    const elapsedMs = Math.max(0, Date.now() - timeOpenMs);
+    const tf = (state.settings.timeframe || '15m').toLowerCase();
+    let barMs = 15 * 60 * 1000;
+    if (tf === '1m') barMs = 60 * 1000;
+    else if (tf === '5m') barMs = 5 * 60 * 1000;
+    else if (tf === '15m') barMs = 15 * 60 * 1000;
+    else if (tf === '1h') barMs = 60 * 60 * 1000;
+    else if (tf === '4h') barMs = 4 * 60 * 60 * 1000;
+    else if (tf === '1d') barMs = 24 * 60 * 60 * 1000;
+
+    const barsElapsed = Math.floor(elapsedMs / barMs);
+
     if (state.settings.activeStrategy === 'volatility_compression_breakout' || state.settings.activeStrategy === 'compression_breakout') {
       const result = manageCompressionBreakoutPosition(
         p,
         { open: currentPrice, high: currentPrice, low: currentPrice, close: currentPrice },
         p.entryAtr || currentPrice * 0.02,
-        p.barsOpen || 0
+        barsElapsed
       );
 
       if (result.action === 'EXIT') {

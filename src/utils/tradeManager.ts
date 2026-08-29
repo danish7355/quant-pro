@@ -169,9 +169,9 @@ export function manageCompressionBreakoutPosition(
 ): TradeManagerResult {
   const isLong = pos.direction === 'LONG';
   let newPos = { ...pos };
-  newPos.barsOpen = (newPos.barsOpen || 0) + 1;
+  newPos.barsOpen = barsOpen;
 
-  // Step 1: Check Fake Breakout Invalidation on bar 1 after entry
+  // Step 1: Check Fake Breakout Invalidation strictly on completed bar 1 (not on tick 0)
   if (newPos.barsOpen === 1 && typeof newPos.windowHigh === 'number' && typeof newPos.windowLow === 'number') {
     const isFake = isLong
       ? candle.close < newPos.windowHigh // snapped back inside the box
