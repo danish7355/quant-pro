@@ -67,7 +67,7 @@ async function startServer() {
   app.post("/api/settings", (req, res) => {
     state.settings = { ...state.settings, ...req.body };
     scheduleStateSync();
-    res.json({ success: true });
+    res.json({ success: true, settings: state.settings });
   });
 
   // Start engine automatically on server boot with state restoration

@@ -1,7 +1,7 @@
 {
   "settings": {
     "market": "CRYPTO",
-    "activeStrategy": "climax_reversal",
+    "activeStrategy": "volatility_compression_breakout",
     "timeframe": "15m",
     "autoTradeThreshold": 55,
     "coinCount": 50,

@@ -424,13 +424,14 @@ export default function App() {
   };
 
   const updateSettings = async (newSettings: AppSettings) => {
+    setSettings(newSettings);
+    safeSetLocal('bt_app_settings', JSON.stringify(newSettings));
     try {
        await fetch('/api/settings', {
          method: 'POST',
          headers: { 'Content-Type': 'application/json' },
          body: JSON.stringify(newSettings)
        });
-       setSettings(newSettings);
     } catch (e) {
        console.error(e);
     }
@@ -605,7 +606,7 @@ export default function App() {
             </div>
           )}
           {activeTab === 'backtest' && (
-            <BacktestLab settings={settings} coins={coins} selectedSymbol={selectedSymbol} onSelectSymbol={setSelectedSymbol} />
+            <BacktestLab settings={settings} coins={coins} selectedSymbol={selectedSymbol} onSelectSymbol={setSelectedSymbol} onUpdateSettings={updateSettings} />
           )}
           {activeTab === 'strategy_lab' && (
             <StrategyLab settings={settings} onUpdateSettings={updateSettings} />

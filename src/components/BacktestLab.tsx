@@ -13,9 +13,10 @@ interface BacktestLabProps {
   coins: any[];
   selectedSymbol: string;
   onSelectSymbol: (symbol: string) => void;
+  onUpdateSettings?: (newSettings: AppSettings) => void;
 }
 
-export default function BacktestLab({ settings, coins, selectedSymbol, onSelectSymbol }: BacktestLabProps) {
+export default function BacktestLab({ settings, coins, selectedSymbol, onSelectSymbol, onUpdateSettings }: BacktestLabProps) {
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [running, setRunning] = useState(false);
 
@@ -28,20 +29,23 @@ export default function BacktestLab({ settings, coins, selectedSymbol, onSelectS
     }
 
     // Run backtest calculation
-    setTimeout(() => {
-      const res = runBacktest(targetCoin.candles, settings, targetCoin.symbol);
-      setResult(res);
+    try {
+      const bResult = runBacktest(targetCoin.candles, settings, targetCoin.symbol);
+      setResult(bResult);
+    } catch (e) {
+      console.error("Backtest execution error", e);
+    } finally {
       setRunning(false);
-    }, 100);
+    }
   };
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto font-mono text-gray-200">
-      {/* Header Bar */}
-      <div className="flex items-center justify-between bg-[#161B22] p-4 rounded-xl border border-[#30363D]">
+      {/* Header & Controls */}
+      <div className="bg-[#161B22] border border-[#30363D] p-5 rounded-xl flex flex-col md:flex-row items-center justify-between gap-4">
         <div>
           <h3 className="text-sm font-bold text-emerald-400 flex items-center gap-2">
-            <LineChart size={16} /> BACKTEST ENGINE & STRATEGY LAB
+            <Play size={16} /> ALGORITHMIC STRATEGY HISTORICAL REPLAY BACKTESTER
           </h3>
           <p className="text-xs text-gray-400 mt-1">
             Chronological multi-candle replay with 0 look-ahead bias, simulated 0.04% taker fee, and 0.03% slippage.
@@ -52,7 +56,11 @@ export default function BacktestLab({ settings, coins, selectedSymbol, onSelectS
           <select
             value={settings.activeStrategy || 'v2'}
             onChange={(e) => {
-              settings.activeStrategy = e.target.value;
+              if (onUpdateSettings) {
+                onUpdateSettings({ ...settings, activeStrategy: e.target.value });
+              } else {
+                settings.activeStrategy = e.target.value;
+              }
             }}
             className="bg-[#0E1117] border border-[#30363D] text-xs rounded px-3 py-1.5 focus:outline-none focus:border-emerald-500 font-bold text-emerald-400"
           >
