@@ -128,7 +128,7 @@ export let state = {
     activeStrategy: 'v2',
     timeframe: '4H' as Timeframe,
     autoTradeThreshold: 60,
-    coinCount: 20,
+    coinCount: 50,
     autoTradeEnabled: true,
     scanInterval: 30,
     theme: 'dark',
@@ -436,9 +436,11 @@ function processAutoTradingRules(scannedList: CoinDetail[]) {
   // Sort by absolute score strength (strongest signal first, regardless of direction)
   validCandidates.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
 
-  if (validCandidates.length > 0) {
-    const topCandidate = validCandidates[0];
-    openPosition(topCandidate);
+  const availableSlots = state.settings.maxConcurrentTrades - openCount;
+  const toOpen = validCandidates.slice(0, availableSlots);
+
+  for (const candidate of toOpen) {
+    openPosition(candidate);
   }
 }
 
@@ -499,11 +501,15 @@ function openPosition(coin: CoinDetail) {
     return;
   }
 
-  // Validate minimum Risk:Reward ratio
-  const tp1Dist = Math.abs(tp1 - coin.price);
-  const rrRatio = tp1Dist / slDist;
-  if (state.settings.minRRRatio > 0 && rrRatio < state.settings.minRRRatio) {
-    addTerminalLog(`⚠️ Skipped ${coin.symbol}: R:R ${rrRatio.toFixed(2)} < min ${state.settings.minRRRatio}`);
+  // Validate minimum Risk:Reward ratio based on full trade potential (max TP or trailing potential)
+  const maxTpDist = Math.max(
+    Math.abs(tp1 - coin.price),
+    Math.abs(tp2 - coin.price),
+    Math.abs(tp3 - coin.price)
+  );
+  const potentialRrRatio = maxTpDist / slDist;
+  if (state.settings.minRRRatio > 0 && potentialRrRatio < state.settings.minRRRatio) {
+    addTerminalLog(`⚠️ Skipped ${coin.symbol}: Potential R:R ${potentialRrRatio.toFixed(2)} < min ${state.settings.minRRRatio}`);
     return;
   }
 

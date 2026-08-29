@@ -596,178 +596,156 @@ export function runScoringEngine(
   // VOLATILITY COMPRESSION BREAKOUT STRATEGY
   // ==========================================
   if (params.activeStrategy === 'volatility_compression_breakout' || params.activeStrategy === 'compression_breakout') {
-    // ── Core compression parameters (relaxed individual thresholds) ──
-    const COMPRESSION_LOOKBACK = 10;
-    const COMPRESSION_ATR_RATIO_MAX = 0.70;       // was 0.65 → relaxed
-    const COMPRESSION_WINDOW_ATR_MULT = 3.0;
-    const BOUNDARY_BUFFER_ATR = 0.25;              // was 0.30 → relaxed
-    const RANGE_EXPANSION_MIN = 1.5;               // was 1.8 → relaxed (new gates handle fakes)
-    const VOLUME_EXPANSION_MIN = 1.5;              // was 1.8 → relaxed
-    const CLOSE_STRENGTH_MIN = 0.60;               // was 0.65 → relaxed
+    // ══════════════════════════════════════════════════════════════
+    // VOLATILITY COMPRESSION BREAKOUT — Practical Sliding Window
+    // ══════════════════════════════════════════════════════════════
+    // Scans the last SCAN_DEPTH candles for a breakout from a prior
+    // compression box. This means the scanner doesn't need to check
+    // at the exact moment of breakout — it can detect breakouts that
+    // happened 1–5 candles ago and still fire a signal.
+    // ══════════════════════════════════════════════════════════════
+
+    const COMPRESSION_LOOKBACK = 10;       // bars in the compression box
+    const SCAN_DEPTH = 5;                  // how many recent candles to check as potential breakout bars
+    const RANGE_EXPANSION_MIN = 1.3;       // breakout candle range vs box avg range
+    const VOLUME_EXPANSION_MIN = 1.3;      // breakout candle volume vs box avg volume  
+    const CLOSE_STRENGTH_MIN = 0.55;       // close in the top/bottom 45% of the bar
+    const BODY_RATIO_MIN = 0.40;           // body ≥ 40% of range (scoring bonus)
+    const BOUNDARY_BUFFER_PCT = 0.001;     // 0.1% buffer beyond box edge (price-relative, not ATR-relative)
     const HTF_BONUS_POINTS = 10;
-    const atr_average_period = 50;
+    const atrPeriod = params.atrPeriod || 14;
 
-    // ── NEW quality gates (fake-signal filters) ──
-    const VOLUME_CONTRACTION_MAX = 0.60;           // box avg vol ≤ 60% of pre-box avg vol
-    const PRIOR_MOVE_ATR_MIN = 3.0;                // need 3+ ATR move in 20 bars before box
-    const PRIOR_MOVE_LOOKBACK = 20;
-    const BODY_RATIO_MIN = 0.50;                   // breakout candle body ≥ 50% of range (scoring bonus)
-    const PRE_BOX_VOLUME_LOOKBACK = 20;
+    // Minimum data needed: lookback + scan + warmup
+    const minBars = COMPRESSION_LOOKBACK + SCAN_DEPTH + atrPeriod + 10;
 
-    if (closes.length >= Math.max(COMPRESSION_LOOKBACK + PRIOR_MOVE_LOOKBACK + 5, atr_average_period + 14)) {
-      // 1. Calculate ATR14 and ATR Avg 50
+    if (closes.length >= minBars) {
+      // Pre-compute TR array
       const tr = Array(idx + 1).fill(0);
       for (let j = 1; j <= idx; j++) {
         tr[j] = Math.max(highs[j] - lows[j], Math.abs(highs[j] - closes[j - 1]), Math.abs(lows[j] - closes[j - 1]));
       }
-      const curAtr = tr.slice(idx - (params.atrPeriod || 14) + 1, idx + 1).reduce((a, b) => a + b, 0) / (params.atrPeriod || 14);
 
-      let atrSum = 0;
-      for (let j = idx - atr_average_period + 1; j <= idx; j++) {
-        const subTr = tr.slice(j - (params.atrPeriod || 14) + 1, j + 1).reduce((a, b) => a + b, 0) / (params.atrPeriod || 14);
-        atrSum += subTr;
-      }
-      const atrAvg50 = atrSum / atr_average_period;
+      // Scan each of the last SCAN_DEPTH candles as a potential breakout bar
+      let bestResult: {
+        score: number; direction: 'LONG' | 'SHORT'; bIdx: number;
+        rangeExp: number; volExp: number; closeStr: number; bodyRatio: number;
+        windowHigh: number; windowLow: number; windowAvgRange: number; windowAvgVolume: number;
+      } | null = null;
 
-      // 2. 10-Candle Compression Window (bars idx - COMPRESSION_LOOKBACK to idx - 1)
-      const windowStart = idx - COMPRESSION_LOOKBACK;
-      const windowEnd = idx - 1;
-      let windowHigh = -Infinity;
-      let windowLow = Infinity;
-      let windowRangeSum = 0;
-      let windowVolSum = 0;
+      for (let offset = 0; offset < SCAN_DEPTH; offset++) {
+        const bIdx = idx - offset; // breakout bar candidate
+        const boxEnd = bIdx - 1;   // last bar of the compression box
+        const boxStart = boxEnd - COMPRESSION_LOOKBACK + 1;
+        if (boxStart < atrPeriod) continue;
 
-      for (let j = windowStart; j <= windowEnd; j++) {
-        if (highs[j] > windowHigh) windowHigh = highs[j];
-        if (lows[j] < windowLow) windowLow = lows[j];
-        windowRangeSum += (highs[j] - lows[j]);
-        windowVolSum += volumes[j];
-      }
+        // ── Compression Box Stats ──
+        let wHigh = -Infinity, wLow = Infinity, wRangeSum = 0, wVolSum = 0;
+        for (let j = boxStart; j <= boxEnd; j++) {
+          if (highs[j] > wHigh) wHigh = highs[j];
+          if (lows[j] < wLow) wLow = lows[j];
+          wRangeSum += (highs[j] - lows[j]);
+          wVolSum += volumes[j];
+        }
+        const wRange = wHigh - wLow;
+        const wAvgRange = wRangeSum / COMPRESSION_LOOKBACK;
+        const wAvgVol = wVolSum / COMPRESSION_LOOKBACK;
 
-      const windowRange = windowHigh - windowLow;
-      const windowAvgRange = windowRangeSum / COMPRESSION_LOOKBACK;
-      const windowAvgVolume = windowVolSum / COMPRESSION_LOOKBACK;
+        // ── Compression Quality Check ──
+        // Instead of comparing ATR to a 50-bar average (which fails in trending markets),
+        // compare the box range to a wider lookback range (30 bars before the box).
+        // If the box is tight relative to recent price action, it's compressed.
+        const widerStart = Math.max(0, boxStart - 30);
+        let widerHigh = -Infinity, widerLow = Infinity;
+        let widerRangeSum = 0;
+        const widerCount = boxStart - widerStart;
+        for (let j = widerStart; j < boxStart; j++) {
+          if (highs[j] > widerHigh) widerHigh = highs[j];
+          if (lows[j] < widerLow) widerLow = lows[j];
+          widerRangeSum += (highs[j] - lows[j]);
+        }
+        const widerRange = widerHigh - widerLow;
+        const widerAvgRange = widerCount > 0 ? widerRangeSum / widerCount : wAvgRange;
 
-      // Compression ATR at bar (idx - 1) prior to current breakout bar
-      const boxAtr = tr.slice(Math.max(0, (idx - 1) - (params.atrPeriod || 14) + 1), idx).reduce((a, b) => a + b, 0) / (params.atrPeriod || 14);
+        // Compression: box avg range should be notably smaller than wider avg range
+        // AND box total range should be smaller than wider total range
+        const rangeContraction = widerAvgRange > 0 ? wAvgRange / widerAvgRange : 1;
+        const totalRangeContraction = widerRange > 0 ? wRange / widerRange : 1;
+        const isCompressed = rangeContraction <= 0.85 && totalRangeContraction <= 0.60;
 
-      // ── NEW GATE 1: Volume Contraction ──
-      // Calculate pre-box average volume (20 bars before the compression window)
-      const preBoxVolStart = Math.max(0, windowStart - PRE_BOX_VOLUME_LOOKBACK);
-      const preBoxVolEnd = windowStart - 1;
-      let preBoxVolSum = 0;
-      let preBoxVolCount = 0;
-      for (let j = preBoxVolStart; j <= preBoxVolEnd && j >= 0; j++) {
-        preBoxVolSum += volumes[j];
-        preBoxVolCount++;
-      }
-      const preBoxAvgVolume = preBoxVolCount > 0 ? preBoxVolSum / preBoxVolCount : windowAvgVolume;
-      const volumeContractionRatio = preBoxAvgVolume > 0 ? windowAvgVolume / preBoxAvgVolume : 1;
-      const hasVolumeContraction = volumeContractionRatio <= VOLUME_CONTRACTION_MAX;
+        if (!isCompressed) continue;
 
-      // ── NEW GATE 2: Prior Impulse Move ──
-      // Check that price moved at least PRIOR_MOVE_ATR_MIN * ATR in the 20 bars before the box
-      const priorMoveStart = Math.max(0, windowStart - PRIOR_MOVE_LOOKBACK);
-      let priorHigh = -Infinity;
-      let priorLow = Infinity;
-      for (let j = priorMoveStart; j < windowStart; j++) {
-        if (highs[j] > priorHigh) priorHigh = highs[j];
-        if (lows[j] < priorLow) priorLow = lows[j];
-      }
-      const priorMoveRange = priorHigh - priorLow;
-      const priorMoveAtr = (boxAtr || curAtr) > 0 ? priorMoveRange / (boxAtr || curAtr) : 0;
-      const hasPriorImpulse = priorMoveAtr >= PRIOR_MOVE_ATR_MIN;
+        // ── Breakout Detection on bar bIdx ──
+        const bCandle = candles[bIdx];
+        const bRange = highs[bIdx] - lows[bIdx];
+        const buffer = wHigh * BOUNDARY_BUFFER_PCT;
+        const brokeUp = bCandle.close > wHigh + buffer;
+        const brokeDown = bCandle.close < wLow - buffer;
 
-      // Compression check (core gates only — volume contraction & prior impulse are scoring bonuses)
-      const atrRatio = boxAtr / (atrAvg50 || boxAtr);
-      const isCompressed = (atrRatio <= COMPRESSION_ATR_RATIO_MAX) &&
-        (windowRange <= COMPRESSION_WINDOW_ATR_MULT * (boxAtr || curAtr));
+        if (!brokeUp && !brokeDown) continue;
+        if (bRange <= 0 || wAvgRange <= 0 || wAvgVol <= 0) continue;
 
-      // Save compression state to completeIndDetails
-      completeIndDetails.compressionState = {
-        isCompressed,
-        windowHigh,
-        windowLow,
-        windowAvgRange,
-        windowAvgVolume
-      };
+        const dir: 'LONG' | 'SHORT' = brokeUp ? 'LONG' : 'SHORT';
+        const rExp = bRange / wAvgRange;
+        const vExp = bCandle.volume / wAvgVol;
+        const cStr = brokeUp
+          ? (bCandle.close - lows[bIdx]) / bRange
+          : (highs[bIdx] - bCandle.close) / bRange;
+        const bRatio = Math.abs(bCandle.close - bCandle.open) / bRange;
 
-      // 3. Breakout Detection on Current Candle (idx)
-      const curCandle = candles[idx];
-      const curRange = highs[idx] - lows[idx];
-      const brokeUp = curCandle.close > windowHigh + BOUNDARY_BUFFER_ATR * curAtr;
-      const brokeDown = curCandle.close < windowLow - BOUNDARY_BUFFER_ATR * curAtr;
+        // Must meet minimum expansion criteria
+        if (rExp < RANGE_EXPANSION_MIN || vExp < VOLUME_EXPANSION_MIN || cStr < CLOSE_STRENGTH_MIN) continue;
 
-      let breakoutDirection: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL';
-      let rangeExpansion = 0;
-      let volumeExpansion = 0;
-      let closeStrength = 0;
-      let bodyRatio = 0;
-
-      if (isCompressed && (brokeUp || brokeDown) && curRange > 0 && windowAvgRange > 0 && windowAvgVolume > 0) {
-        breakoutDirection = brokeUp ? 'LONG' : 'SHORT';
-        rangeExpansion = curRange / windowAvgRange;
-        volumeExpansion = curCandle.volume / windowAvgVolume;
-        closeStrength = brokeUp ? (curCandle.close - lows[idx]) / curRange : (highs[idx] - curCandle.close) / curRange;
-        bodyRatio = Math.abs(curCandle.close - curCandle.open) / curRange;
-      }
-
-      // 4. Confluence Scoring & HTF Bonus
-      const meetsBreakoutCriteria = breakoutDirection !== 'NEUTRAL' &&
-        rangeExpansion >= RANGE_EXPANSION_MIN &&
-        volumeExpansion >= VOLUME_EXPANSION_MIN &&
-        closeStrength >= CLOSE_STRENGTH_MIN;
-
-      if (meetsBreakoutCriteria) {
-        const excess = (v: number, min: number) => Math.min(v / min, 2);
-        const avgExcess = (
-          excess(rangeExpansion, RANGE_EXPANSION_MIN) +
-          excess(volumeExpansion, VOLUME_EXPANSION_MIN) +
-          excess(closeStrength, CLOSE_STRENGTH_MIN)
-        ) / 3;
-        let baseScore = Math.round(Math.max(45, Math.min(100, 45 + (avgExcess - 1) * 55)));
-
-        // ── NEW: Body Ratio Scoring Bonus ──
-        if (bodyRatio >= BODY_RATIO_MIN) {
-          const bodyBonus = Math.round((bodyRatio - BODY_RATIO_MIN) * 20); // up to +10 for 100% body
-          baseScore = Math.min(100, baseScore + bodyBonus);
-        } else {
-          baseScore = Math.max(45, baseScore - 10); // penalty for weak body
+        // ── Verify the breakout is still valid (price hasn't reversed back into box) ──
+        if (offset > 0) {
+          const currentClose = closes[idx];
+          if (dir === 'LONG' && currentClose < wHigh) continue;  // reversed back below box
+          if (dir === 'SHORT' && currentClose > wLow) continue;  // reversed back above box
         }
 
-        // ── Volume Contraction Quality Bonus/Penalty ──
-        // Real coils have volume drying up; reward that pattern
-        if (hasVolumeContraction) {
-          const contractionBonus = volumeContractionRatio <= 0.35 ? 12 : 6;
-          baseScore = Math.min(100, baseScore + contractionBonus);
-        } else {
-          baseScore = Math.max(45, baseScore - 8); // no contraction = weaker setup
+        // Score this candidate
+        const excess = (v: number, min: number) => Math.min(v / min, 2.5);
+        const avgExcess = (excess(rExp, RANGE_EXPANSION_MIN) + excess(vExp, VOLUME_EXPANSION_MIN) + excess(cStr, CLOSE_STRENGTH_MIN)) / 3;
+        let score = Math.round(Math.max(45, Math.min(100, 45 + (avgExcess - 1) * 36.7)));
+
+        // Body ratio bonus
+        if (bRatio >= BODY_RATIO_MIN) {
+          score = Math.min(100, score + Math.round((bRatio - BODY_RATIO_MIN) * 15));
         }
 
-        // ── Prior Impulse Quality Bonus/Penalty ──
-        // Setups after a sharp move have more stored energy
-        if (hasPriorImpulse) {
-          const impulseBonus = priorMoveAtr >= 5.0 ? 10 : 5;
-          baseScore = Math.min(100, baseScore + impulseBonus);
-        } else {
-          baseScore = Math.max(45, baseScore - 5); // no prior move = weaker
-        }
+        // Freshness bonus (breakout on current bar is best, older = slight penalty)
+        score = Math.max(45, score - offset * 3);
 
-        // HTF Bonus (50 EMA Slope)
+        if (!bestResult || score > bestResult.score) {
+          bestResult = { score, direction: dir, bIdx, rangeExp: rExp, volExp: vExp, closeStr: cStr, bodyRatio: bRatio, windowHigh: wHigh, windowLow: wLow, windowAvgRange: wAvgRange, windowAvgVolume: wAvgVol };
+        }
+      }
+
+      if (bestResult) {
+        let finalScore = bestResult.score;
+
+        // HTF EMA50 slope bonus
         const ema50All = calculateEMA(closes.slice(0, idx + 1), 50);
         const ema50Slope = ema50All.length >= 5 ? (ema50All[ema50All.length - 1] - ema50All[ema50All.length - 5]) / ema50All[ema50All.length - 5] * 100 : 0;
-        const htfAligned = breakoutDirection === 'LONG' ? ema50Slope > 0.02 : ema50Slope < -0.02;
-        if (htfAligned) {
-          baseScore = Math.min(100, baseScore + HTF_BONUS_POINTS);
-        }
+        const htfAligned = bestResult.direction === 'LONG' ? ema50Slope > 0.02 : ema50Slope < -0.02;
+        if (htfAligned) finalScore = Math.min(100, finalScore + HTF_BONUS_POINTS);
 
-        const finalSignedScore = baseScore * (breakoutDirection === 'SHORT' ? -1 : 1);
+        const signedScore = finalScore * (bestResult.direction === 'SHORT' ? -1 : 1);
+        const barsAgo = idx - bestResult.bIdx;
+
+        // Save compression state
+        completeIndDetails.compressionState = {
+          isCompressed: true,
+          windowHigh: bestResult.windowHigh,
+          windowLow: bestResult.windowLow,
+          windowAvgRange: bestResult.windowAvgRange,
+          windowAvgVolume: bestResult.windowAvgVolume
+        };
 
         return {
-          score: finalSignedScore,
-          direction: breakoutDirection,
+          score: signedScore,
+          direction: bestResult.direction,
           status: 'BREAKOUT_EXPANSION',
-          reason: `All gates passed | Volatility Breakout (Range: ${rangeExpansion.toFixed(1)}x, Vol: ${volumeExpansion.toFixed(1)}x, CloseStr: ${(closeStrength * 100).toFixed(0)}%, Body: ${(bodyRatio * 100).toFixed(0)}%, VolContr: ${(volumeContractionRatio * 100).toFixed(0)}%${htfAligned ? ' +HTF' : ''})`,
+          reason: `Breakout ${barsAgo === 0 ? 'NOW' : barsAgo + ' bars ago'} | Range: ${bestResult.rangeExp.toFixed(1)}x, Vol: ${bestResult.volExp.toFixed(1)}x, CloseStr: ${(bestResult.closeStr * 100).toFixed(0)}%, Body: ${(bestResult.bodyRatio * 100).toFixed(0)}%${htfAligned ? ' +HTF' : ''}`,
           indicators: completeIndDetails,
           gates: { ...defaultGates, g1: true, g2: true, g3: true, g4: true, g5: true, g6: true, g7: true, g8: true, g9: true, g10: true, blockReasons: [] },
           wmPattern: 'NONE',
@@ -775,77 +753,76 @@ export function runScoringEngine(
         };
       }
 
-      // 5. Compression Proximity Score (when coiling or building toward a breakout)
-      let coilProximity = 0;
+      // ── No breakout found — show proximity/coil status ──
+      // Check the current bar's box for compression proximity
+      const curBoxEnd = idx;
+      const curBoxStart = idx - COMPRESSION_LOOKBACK + 1;
+      let cWHigh = -Infinity, cWLow = Infinity, cWRangeSum = 0, cWVolSum = 0;
+      for (let j = curBoxStart; j <= curBoxEnd; j++) {
+        if (highs[j] > cWHigh) cWHigh = highs[j];
+        if (lows[j] < cWLow) cWLow = lows[j];
+        cWRangeSum += (highs[j] - lows[j]);
+        cWVolSum += volumes[j];
+      }
+      const cWAvgRange = cWRangeSum / COMPRESSION_LOOKBACK;
+      const cWAvgVol = cWVolSum / COMPRESSION_LOOKBACK;
+
+      // Check compression relative to 30 bars before
+      const cWiderStart = Math.max(0, curBoxStart - 30);
+      let cWiderRangeSum = 0;
+      const cWiderCount = curBoxStart - cWiderStart;
+      for (let j = cWiderStart; j < curBoxStart; j++) {
+        cWiderRangeSum += (highs[j] - lows[j]);
+      }
+      const cWiderAvgRange = cWiderCount > 0 ? cWiderRangeSum / cWiderCount : cWAvgRange;
+      const curRangeContraction = cWiderAvgRange > 0 ? cWAvgRange / cWiderAvgRange : 1;
+      const curCompressed = curRangeContraction <= 0.85;
+
+      let coilScore = 0;
       const coilReasons: string[] = [];
 
-      // ATR compression
-      if (atrRatio <= COMPRESSION_ATR_RATIO_MAX) {
-        coilProximity += 12;
-        coilReasons.push(`Low ATR ratio (${atrRatio.toFixed(2)}x)`);
-      }
-      // Window range tight
-      if (windowRange <= COMPRESSION_WINDOW_ATR_MULT * (boxAtr || curAtr)) {
-        coilProximity += 12;
-        coilReasons.push(`Contained range (${(windowRange / (boxAtr || curAtr)).toFixed(1)} ATR)`);
-      }
-      // Volume contraction active
-      if (hasVolumeContraction) {
-        coilProximity += 10;
-        coilReasons.push(`Volume contracting (${(volumeContractionRatio * 100).toFixed(0)}% of pre-box)`);
-      }
-      // Prior impulse loaded
-      if (hasPriorImpulse) {
-        coilProximity += 8;
-        coilReasons.push(`Prior move loaded (${priorMoveAtr.toFixed(1)} ATR)`);
+      if (curCompressed) {
+        coilScore += 25;
+        coilReasons.push(`Range contracting (${(curRangeContraction * 100).toFixed(0)}% of prior)`);
+      } else if (curRangeContraction <= 1.0) {
+        coilScore += 10;
+        coilReasons.push(`Slight contraction (${(curRangeContraction * 100).toFixed(0)}%)`);
       }
 
-      const distToHigh = Math.abs(curCandle.close - windowHigh) / (curAtr || 1);
-      const distToLow = Math.abs(curCandle.close - windowLow) / (curAtr || 1);
-      let proximityDir: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL';
+      // Edge proximity
+      const curAtr = tr.slice(idx - atrPeriod + 1, idx + 1).reduce((a, b) => a + b, 0) / atrPeriod;
+      const dHigh = Math.abs(closes[idx] - cWHigh) / (curAtr || 1);
+      const dLow = Math.abs(closes[idx] - cWLow) / (curAtr || 1);
+      let proxDir: 'LONG' | 'SHORT' | 'NEUTRAL' = 'NEUTRAL';
 
-      if (distToHigh < 0.4) {
-        coilProximity += 10;
-        proximityDir = 'LONG';
-        coilReasons.push('Testing upper box edge');
-      } else if (distToLow < 0.4) {
-        coilProximity += 10;
-        proximityDir = 'SHORT';
-        coilReasons.push('Testing lower box edge');
-      }
+      if (dHigh < 0.5) { coilScore += 10; proxDir = 'LONG'; coilReasons.push('Near upper edge'); }
+      else if (dLow < 0.5) { coilScore += 10; proxDir = 'SHORT'; coilReasons.push('Near lower edge'); }
 
-      if (curCandle.volume > windowAvgVolume * 1.2) {
-        coilProximity += 5;
-        coilReasons.push('Volume stirring');
-      }
+      // Volume declining
+      if (cWAvgVol < cWiderAvgRange * 0.8) { coilScore += 5; coilReasons.push('Volume declining'); }
 
-      coilProximity = Math.min(coilProximity, 55);
+      coilScore = Math.min(55, coilScore);
+
+      // Save compression state
+      completeIndDetails.compressionState = {
+        isCompressed: curCompressed,
+        windowHigh: cWHigh,
+        windowLow: cWLow,
+        windowAvgRange: cWAvgRange,
+        windowAvgVolume: cWAvgVol
+      };
 
       const compressionGates = { ...defaultGates, blockReasons: [] as string[] };
       compressionGates.g1 = true;
-      compressionGates.g2 = hasPriorImpulse;
-      compressionGates.g3 = atrRatio <= COMPRESSION_ATR_RATIO_MAX;
-      compressionGates.g4 = hasVolumeContraction;
-      compressionGates.g5 = windowRange <= COMPRESSION_WINDOW_ATR_MULT * (boxAtr || curAtr);
-      compressionGates.g6 = brokeUp || brokeDown;
-      compressionGates.g7 = rangeExpansion >= RANGE_EXPANSION_MIN;
-      compressionGates.g8 = volumeExpansion >= VOLUME_EXPANSION_MIN;
-      compressionGates.g9 = closeStrength >= CLOSE_STRENGTH_MIN;
-
-      if (!hasPriorImpulse) compressionGates.blockReasons.push(`Prior move too small (${priorMoveAtr.toFixed(1)} ATR < ${PRIOR_MOVE_ATR_MIN})`);
-      if (atrRatio > COMPRESSION_ATR_RATIO_MAX) compressionGates.blockReasons.push(`ATR ratio too high (${atrRatio.toFixed(2)} > ${COMPRESSION_ATR_RATIO_MAX})`);
-      if (!hasVolumeContraction) compressionGates.blockReasons.push(`Volume not contracted (${(volumeContractionRatio * 100).toFixed(0)}% > ${VOLUME_CONTRACTION_MAX * 100}%)`);
-      if (windowRange > COMPRESSION_WINDOW_ATR_MULT * (boxAtr || curAtr)) compressionGates.blockReasons.push('Window range too wide');
-      if (!brokeUp && !brokeDown) compressionGates.blockReasons.push('No boundary breakout');
-      if (rangeExpansion < RANGE_EXPANSION_MIN) compressionGates.blockReasons.push(`Range expansion < ${RANGE_EXPANSION_MIN}x`);
-      if (volumeExpansion < VOLUME_EXPANSION_MIN) compressionGates.blockReasons.push(`Volume expansion < ${VOLUME_EXPANSION_MIN}x`);
-      if (closeStrength < CLOSE_STRENGTH_MIN) compressionGates.blockReasons.push(`Close strength < ${(CLOSE_STRENGTH_MIN * 100).toFixed(0)}%`);
+      compressionGates.g3 = curCompressed;
+      if (!curCompressed) compressionGates.blockReasons.push(`Range not contracting (${(curRangeContraction * 100).toFixed(0)}% of prior, need ≤85%)`);
+      compressionGates.blockReasons.push('No breakout detected in last 5 candles');
 
       return {
-        score: coilProximity * (proximityDir === 'SHORT' ? -1 : 1),
-        direction: proximityDir,
-        status: isCompressed ? 'COMPRESSION_COIL' : regime.label,
-        reason: coilReasons.length > 0 ? coilReasons.join(' | ') : 'No compression or breakout detected',
+        score: coilScore * (proxDir === 'SHORT' ? -1 : 1),
+        direction: proxDir,
+        status: curCompressed ? 'COMPRESSION_COIL' : regime.label,
+        reason: coilReasons.length > 0 ? coilReasons.join(' | ') : 'No compression detected',
         indicators: completeIndDetails,
         gates: compressionGates,
         wmPattern: 'NONE',
@@ -859,7 +836,7 @@ export function runScoringEngine(
       status: regime.label,
       reason: 'Insufficient history for compression breakout analysis',
       indicators: completeIndDetails,
-      gates: { ...defaultGates, blockReasons: ['Need 75+ candles for compression analysis'] },
+      gates: { ...defaultGates, blockReasons: ['Need more candle history'] },
       wmPattern: 'NONE',
       regime
     };

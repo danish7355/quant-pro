@@ -30,7 +30,7 @@ const INITIAL_SETTINGS: AppSettings = {
   activeStrategy: 'v2',
   timeframe: '4H',
   autoTradeThreshold: 60, // Minimum Score for Trade 60 instead of 65
-  coinCount: 20,
+  coinCount: 50,
   autoTradeEnabled: true,
   scanInterval: 300, // 5 minutes default
   theme: 'dark',
