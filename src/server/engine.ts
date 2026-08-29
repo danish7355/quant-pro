@@ -126,7 +126,7 @@ export let state = {
   settings: {
     market: 'CRYPTO',
     activeStrategy: 'v2',
-    timeframe: '4H' as Timeframe,
+    timeframe: '15m' as Timeframe,
     autoTradeThreshold: 60,
     coinCount: 50,
     autoTradeEnabled: true,
@@ -285,8 +285,9 @@ async function fetchTopFuturesPairs() {
   }
 
   try {
+    const STABLECOIN_PAIRS = ['USDCUSDT', 'FDUSDUSDT', 'TUSDUSDT', 'USDPUSDT', 'EURUSDT', 'BUSDUSDT', 'AEURUSDT'];
     cachedTopPairs = data
-      .filter((c: any) => c.symbol && c.symbol.endsWith('USDT'))
+      .filter((c: any) => c.symbol && c.symbol.endsWith('USDT') && !STABLECOIN_PAIRS.includes(c.symbol))
       .sort((a: any, b: any) => parseFloat(b.quoteVolume || b.volume || 0) - parseFloat(a.quoteVolume || a.volume || 0))
       .map((c: any) => ({
         symbol: c.symbol,
@@ -396,13 +397,14 @@ export async function scanMarkets() {
     await new Promise(r => setTimeout(r, 200));
 
     const candles = await fetchKlines(c.symbol, state.settings.timeframe);
-    if (candles.length < 200) continue;
+    if (candles.length < 50) continue;
 
     const analysis = runScoringEngine(candles, state.settings);
     
+    const currentPrice = candles[candles.length - 1]?.close || c.price;
     updatedCoins.push({
       symbol: c.symbol,
-      price: c.price,
+      price: currentPrice,
       change24h: c.change24h,
       score: analysis.score,
       direction: analysis.direction as any,
@@ -561,7 +563,7 @@ function openPosition(coin: CoinDetail) {
   state.positions.push(newPos);
   state.balance -= allocatedBalance;
   scheduleStateSync();
-  addTerminalLog(`Opened ${coin.direction} on ${coin.symbol} at ${coin.price} | SL: ${sl.toFixed(4)} | TP1: ${tp1.toFixed(4)} | R:R: ${rrRatio.toFixed(2)} | Margin: $${allocatedBalance.toFixed(2)}`);
+  addTerminalLog(`Opened ${coin.direction} on ${coin.symbol} at ${coin.price} | SL: ${sl.toFixed(4)} | TP1: ${tp1.toFixed(4)} | R:R: ${potentialRrRatio.toFixed(2)} | Margin: $${allocatedBalance.toFixed(2)}`);
   if (state.settings.alertOnTradeExecuted) {
     dispatchTelegramAlert(`🚨 *NEW TRADE EXECUTED*\nSymbol: ${coin.symbol}\nDirection: ${coin.direction}\nEntry: ${coin.price.toFixed(4)}\nSL: ${sl.toFixed(4)}\nTP1: ${tp1.toFixed(4)}`);
   }

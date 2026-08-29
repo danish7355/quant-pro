@@ -28,7 +28,7 @@ import { manageOpenPositionV3 } from './utils/tradeManager';
 const INITIAL_SETTINGS: AppSettings = {
   market: 'CRYPTO',
   activeStrategy: 'v2',
-  timeframe: '4H',
+  timeframe: '15m',
   autoTradeThreshold: 60, // Minimum Score for Trade 60 instead of 65
   coinCount: 50,
   autoTradeEnabled: true,
