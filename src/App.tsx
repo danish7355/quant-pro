@@ -437,8 +437,37 @@ export default function App() {
     }
   };
 
-  const handleResetBalance = () => {};
-  const handleResetSettings = () => {};
+  const handleResetBalance = async (amount: number = 10000) => {
+    try {
+      const resetAmount = typeof amount === 'number' && !isNaN(amount) && amount > 0 ? amount : 10000;
+      const res = await fetch('/api/engine/reset-balance', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ amount: resetAmount })
+      });
+      if (res.ok) {
+        setBalance(resetAmount);
+        setPositions([]);
+        setTradeLogs([]);
+        setEquitySnapshots([{ time: new Date().toISOString(), balance: resetAmount }]);
+        safeSetLocal('bt_demo_balance', resetAmount.toString());
+        safeSetLocal('bt_positions', '[]');
+        safeSetLocal('bt_trade_logs', '[]');
+        safeSetLocal('bt_equity_snapshots', '[]');
+        lastVersionRef.current = -1;
+      }
+    } catch (e) {
+      console.error("Failed to reset balance", e);
+    }
+  };
+
+  const handleResetSettings = async () => {
+    try {
+      await updateSettings(INITIAL_SETTINGS);
+    } catch (e) {
+      console.error("Failed to reset settings", e);
+    }
+  };
 
   if (!settings) {
     return <div className="min-h-screen bg-[#09090b] text-white flex items-center justify-center">Connecting to Engine...</div>;
@@ -542,8 +571,22 @@ export default function App() {
               <span className="text-gray-600">|</span>
               <div className="flex items-center gap-1.5">
                  <span className="uppercase text-[10px] font-bold tracking-widest">Total Equity:</span>
-                 <span className="text-white font-medium">$\{totalAccountValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                 <span className={`font-medium ${totalAccountValue < 0 ? 'text-rose-400' : 'text-white'}`}>
+                   ${totalAccountValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                 </span>
               </div>
+              <button
+                onClick={() => {
+                  if (window.confirm("Are you sure you want to reset your paper balance to $10,000 and clear all positions?")) {
+                    handleResetBalance(10000);
+                  }
+                }}
+                className="px-2.5 py-1 text-[11px] font-mono font-bold rounded bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/30 transition-all flex items-center gap-1"
+                title="Reset paper account balance to $10,000"
+              >
+                <RefreshCw size={11} />
+                Reset $10k
+              </button>
             </div>
             
             <button className="hidden sm:flex items-center justify-center w-8 h-8 rounded-full bg-[#30363D]/50 hover:bg-[#30363D] text-gray-400 hover:text-white transition-colors border border-gray-700">
@@ -618,6 +661,7 @@ export default function App() {
               balance={balance}
               positions={positions}
               onManualClose={handleManualClose}
+              onResetBalance={handleResetBalance}
               setEngineRunning={() => { fetch('/api/engine/stop', { method: 'POST' }); }}
             />
           )}

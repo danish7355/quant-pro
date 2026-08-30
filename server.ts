@@ -1,7 +1,7 @@
 import express from "express";
 import path from "path";
 import compression from "compression";
-import { state, stateVersion, startEngine, stopEngine, closeManualPosition, loadStateFromFirebase, scheduleStateSync } from "./src/server/engine";
+import { state, stateVersion, startEngine, stopEngine, closeManualPosition, resetAccountBalance, loadStateFromFirebase, scheduleStateSync } from "./src/server/engine";
 
 async function startServer() {
   const app = express();
@@ -62,6 +62,12 @@ async function startServer() {
     } else {
        res.status(400).json({ success: false, message: "Missing id" });
     }
+  });
+
+  app.post("/api/engine/reset-balance", (req, res) => {
+    const amount = typeof req.body?.amount === 'number' && !isNaN(req.body.amount) ? req.body.amount : 10000;
+    resetAccountBalance(amount);
+    res.json({ success: true, balance: state.balance, message: `Balance successfully reset to $${amount.toLocaleString()}` });
   });
 
   app.post("/api/settings", (req, res) => {

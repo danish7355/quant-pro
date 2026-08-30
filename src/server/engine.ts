@@ -154,7 +154,7 @@ export let state = {
     volumeMultiplier: 1.5,
     fibLookback: 100,
     atrPeriod: 14,
-    startingBalance: 1000,
+    startingBalance: 10000,
     positionSizePct: 10,
     accountRiskPct: 2,
     leverage: 10,
@@ -180,7 +180,7 @@ export let state = {
     alertOnDailyLossLimit: true,
     alertOnRangingDetected: false
   } as AppSettings,
-  balance: 1000,
+  balance: 10000,
   positions: [] as Position[],
   tradeLogs: [] as TradeLog[],
   equitySnapshots: [] as EquitySnapshot[],
@@ -534,6 +534,11 @@ function openPosition(coin: CoinDetail) {
     return;
   }
 
+  if (state.balance < allocatedBalance) {
+    addTerminalLog(`⚠️ Skipped ${coin.symbol}: Insufficient available margin (Need $${allocatedBalance.toFixed(2)}, Available: $${state.balance.toFixed(2)})`);
+    return;
+  }
+
   const qty = sizeRes.quantity;
   const allocatedBalance = sizeRes.allocatedMargin;
 
@@ -562,12 +567,23 @@ function openPosition(coin: CoinDetail) {
   };
 
   state.positions.push(newPos);
-  state.balance -= allocatedBalance;
+  state.balance = Math.max(0, state.balance - allocatedBalance);
   scheduleStateSync();
   addTerminalLog(`Opened ${coin.direction} on ${coin.symbol} at ${coin.price} | SL: ${sl.toFixed(4)} | TP1: ${tp1.toFixed(4)} | R:R: ${potentialRrRatio.toFixed(2)} | Margin: $${allocatedBalance.toFixed(2)}`);
   if (state.settings.alertOnTradeExecuted) {
     dispatchTelegramAlert(`🚨 *NEW TRADE EXECUTED*\nSymbol: ${coin.symbol}\nDirection: ${coin.direction}\nEntry: ${coin.price.toFixed(4)}\nSL: ${sl.toFixed(4)}\nTP1: ${tp1.toFixed(4)}`);
   }
+}
+
+export function resetAccountBalance(amount: number = 10000) {
+  state.balance = amount;
+  state.positions = [];
+  state.tradeLogs = [];
+  state.equitySnapshots = [{ time: new Date().toISOString(), balance: amount }];
+  state.settings.startingBalance = amount;
+  addTerminalLog(`🔄 Account balance reset to $${amount.toLocaleString()}`);
+  bumpStateVersion();
+  scheduleStateSync();
 }
 
 export function closeManualPosition(id: string) {
@@ -581,7 +597,7 @@ export function closePartialPosition(pos: Position, reason: TradeLog["exitReason
   if (idx === -1) return;
   const pnl = pos.unrealizedPnl * partialRatio;
   const marginFreed = pos.allocatedBalance * partialRatio;
-  state.balance += (marginFreed + pnl);
+  state.balance = Math.max(0, state.balance + (marginFreed + pnl));
   
   const log: TradeLog = {
     id: Math.random().toString(36).substr(2, 9),
@@ -612,7 +628,7 @@ export function closePosition(pos: Position, reason: TradeLog['exitReason']) {
   
   state.positions.splice(idx, 1);
   const profit = pos.unrealizedPnl;
-  state.balance += (pos.allocatedBalance + profit);
+  state.balance = Math.max(0, state.balance + (pos.allocatedBalance + profit));
 
   const log: TradeLog = {
     id: Math.random().toString(36).substr(2, 9),

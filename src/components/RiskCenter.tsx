@@ -13,6 +13,7 @@ interface RiskCenterProps {
   balance: number;
   positions: Position[];
   onManualClose: (id: string) => void;
+  onResetBalance?: (amount?: number) => void;
   setEngineRunning: (running: boolean) => void;
 }
 
@@ -22,6 +23,7 @@ export default function RiskCenter({
   balance,
   positions,
   onManualClose,
+  onResetBalance,
   setEngineRunning
 }: RiskCenterProps) {
   // Calculator Sandbox State
@@ -43,7 +45,29 @@ export default function RiskCenter({
   
   return (
     <div className="space-y-6 max-w-7xl mx-auto font-mono text-gray-200">
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
+      {/* Account Balance & Emergency Reset Header */}
+      <div className="bg-[#161B22] border border-[#30363D] p-5 rounded-xl flex flex-col sm:flex-row items-center justify-between gap-4">
+        <div>
+          <h3 className="text-sm font-bold text-gray-200">Paper Trading Account Status</h3>
+          <p className="text-xs text-gray-400 mt-1">
+            Current Available Balance: <span className={`font-bold ${balance < 0 ? 'text-rose-400' : 'text-emerald-400'}`}>${balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span> | Open Positions Margin: <span className="font-bold text-blue-400">${totalAllocatedMargin.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+          </p>
+        </div>
+        {onResetBalance && (
+          <button
+            onClick={() => {
+              if (window.confirm("Reset paper balance to $10,000 and wipe all active positions?")) {
+                onResetBalance(10000);
+              }
+            }}
+            className="px-4 py-2 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 font-bold text-xs rounded-lg border border-rose-500/30 transition-all flex items-center gap-2 shadow-sm"
+          >
+            <DollarSign size={14} /> RESET BALANCE TO $10,000
+          </button>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Sandbox Calculator */}
         <div className="bg-[#161B22] border border-[#30363D] rounded-xl p-4 space-y-4">
           <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2">
